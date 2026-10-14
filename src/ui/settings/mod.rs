@@ -28,10 +28,25 @@ pub(super) fn button(label: &str) -> gtk::Button {
 
 fn dictation_group(form: &Rc<Form>, status: Status, toasts: &adw::ToastOverlay) -> (adw::PreferencesGroup, Rc<dyn Fn()>) {
     let portal_row = adw::ActionRow::builder().title("Global shortcut").subtitle(status.lock().unwrap().as_str()).build();
+    let desktop = shortcut::desktop();
     let system_btn = button("System settings");
-    system_btn.connect_clicked(|_| {
-        let _ = std::process::Command::new("gnome-control-center").args(["keyboard"]).spawn();
+    let toasts_for_btn = toasts.clone();
+    system_btn.connect_clicked(move |_| {
+        let (program, args): (&str, &[&str]) = match shortcut::desktop() {
+            shortcut::Desktop::Gnome => ("gnome-control-center", &["keyboard"]),
+            shortcut::Desktop::Kde => ("kcmshell6", &["kcm_keys"]),
+            shortcut::Desktop::Other => return,
+        };
+        match std::process::Command::new(program).args(args).spawn() {
+            Ok(mut child) => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
+            Err(e) => toast(&toasts_for_btn, &format!("Cannot start {program}: {e}")),
+        }
     });
+    system_btn.set_sensitive(desktop != shortcut::Desktop::Other);
     portal_row.add_suffix(&system_btn);
     {
         let row = portal_row.clone();
@@ -44,7 +59,6 @@ fn dictation_group(form: &Rc<Form>, status: Status, toasts: &adw::ToastOverlay) 
         });
     }
 
-    let desktop = shortcut::desktop();
     let desktop_name = match desktop {
         shortcut::Desktop::Gnome => "GNOME",
         shortcut::Desktop::Kde => "KDE",

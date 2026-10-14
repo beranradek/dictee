@@ -20,11 +20,36 @@ pub struct Mic {
 
 /// Lists PipeWire audio sources (microphones), without monitor sources.
 pub fn list_mics() -> Result<Vec<Mic>> {
-    let out = Command::new("pw-dump").output().context("cannot run pw-dump (is PipeWire installed?)")?;
-    if !out.status.success() {
+    let mut child = Command::new("pw-dump")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("cannot run pw-dump (is PipeWire installed?)")?;
+    let mut stdout = child.stdout.take().expect("piped");
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stdout.read_to_string(&mut text);
+        text
+    });
+    // A wedged PipeWire must not freeze the caller (the controller thread): give pw-dump a deadline.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("pw-dump did not answer within 5 s (is PipeWire running?)");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let text = reader.join().unwrap_or_default();
+    if !status.success() {
         bail!("pw-dump failed");
     }
-    parse_pw_dump(&String::from_utf8_lossy(&out.stdout))
+    parse_pw_dump(&text)
 }
 
 fn parse_pw_dump(json: &str) -> Result<Vec<Mic>> {
@@ -53,7 +78,7 @@ pub enum EndReason {
 
 pub struct Recorder {
     child: Child,
-    reader: JoinHandle<()>,
+    reader: Option<JoinHandle<()>>,
     stopping: Arc<AtomicBool>,
     samples: Arc<Mutex<Vec<i16>>>,
     level: Arc<AtomicU32>,
@@ -78,7 +103,8 @@ impl Recorder {
         let mut stderr = child.stderr.take().context("no pw-record stderr")?;
         let samples = Arc::new(Mutex::new(Vec::new()));
         let level = Arc::new(AtomicU32::new(0));
-        let stopping = Arc::new(AtomicBool::new(false));
+        // "stopping" also guards the start-up window: a pw-record that dies there is reported by `start` itself, not by on_end.
+        let stopping = Arc::new(AtomicBool::new(true));
         let (s2, l2, stop2) = (samples.clone(), level.clone(), stopping.clone());
         let reader = std::thread::spawn(move || {
             let mut on_end = Some(on_end);
@@ -126,11 +152,12 @@ impl Recorder {
                 bail!("pw-record exited ({status}) - is {target} available? {}", why.trim());
             }
         }
+        stopping.store(false, Ordering::SeqCst); // started: from now on an unexpected end is reported through on_end
         std::thread::spawn(move || {
             let mut sink = Vec::new();
             let _ = stderr.read_to_end(&mut sink); // drain so pw-record can never block on a full pipe
         });
-        Ok(Self { child, reader, stopping, samples, level })
+        Ok(Self { child, reader: Some(reader), stopping, samples, level })
     }
 
     /// Current input level (RMS of the last chunk, 0..32767).
@@ -152,7 +179,9 @@ impl Recorder {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = self.reader.join();
+        if let Some(r) = self.reader.take() {
+            let _ = r.join();
+        }
         let s = self.samples.lock().unwrap();
         s.iter().map(|&x| x as f32 / 32768.0).collect()
     }
@@ -161,7 +190,18 @@ impl Recorder {
         self.stopping.store(true, Ordering::SeqCst);
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = self.reader.join();
+        if let Some(r) = self.reader.take() {
+            let _ = r.join();
+        }
+    }
+}
+
+impl Drop for Recorder {
+    /// A recorder that is dropped without stop/cancel (a panic elsewhere) must not leave pw-record and the microphone open.
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::SeqCst);
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 

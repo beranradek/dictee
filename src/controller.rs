@@ -68,14 +68,24 @@ pub struct Outcome {
 }
 
 /// Transcribes and optionally rewrites. `on_state` reports the stage changes.
-pub fn process<T: Transcribe>(cfg: &Config, stt: &mut T, samples: &[f32], mut on_state: impl FnMut(State)) -> Result<Outcome> {
+pub fn process<T: Transcribe>(
+    cfg: &Config,
+    stt: &mut T,
+    samples: &[f32],
+    mut on_state: impl FnMut(State),
+    cancelled: &AtomicBool,
+) -> Result<Outcome> {
     on_state(State::Transcribing);
     let raw = stt.transcribe(cfg, samples)?;
     if raw.is_empty() || cfg.rewrite.engine == "none" {
         return Ok(Outcome { text: raw.clone(), raw, rewrite_error: None });
     }
+    if cancelled.load(Ordering::SeqCst) {
+        // Cancelled while transcribing: the text must not be sent to a rewrite engine (possibly a remote service).
+        return Ok(Outcome { text: raw.clone(), raw, rewrite_error: None });
+    }
     on_state(State::Rewriting);
-    match rewrite::rewrite(cfg, &raw).and_then(|reply| rewrite::check_reply(&raw, &reply)) {
+    match rewrite::rewrite(cfg, &raw, cancelled).and_then(|reply| rewrite::check_reply(&raw, &reply)) {
         Ok(text) => Ok(Outcome { raw, text, rewrite_error: None }),
         Err(e) => Ok(Outcome { text: raw.clone(), raw, rewrite_error: Some(format!("{e:#}")) }),
     }
@@ -120,7 +130,7 @@ pub fn finish<T: Transcribe>(cfg: &Config, stt: &mut T, out: &impl Output, sampl
     if samples.is_empty() {
         bail!("no audio was captured - check the microphone in Settings");
     }
-    let outcome = process(cfg, stt, samples, &mut *hooks.on_state)?;
+    let outcome = process(cfg, stt, samples, &mut *hooks.on_state, hooks.cancelled)?;
     if hooks.cancelled.load(Ordering::SeqCst) {
         return Ok(None); // the user cancelled while the engines were working: deliver nothing
     }
@@ -176,6 +186,20 @@ impl Ctx {
         eprintln!("dictee: {title}: {detail}");
         self.emit(Event::HideBubble);
         SystemOutput.notify(title, detail);
+    }
+}
+
+/// Ends a job: the state goes back to Idle first, then `running` is cleared, so a new recording can never be overwritten by a
+/// late Idle. Runs on drop, so even a panicking worker cannot leave the daemon stuck in "transcribing".
+struct JobEnd {
+    ctx: Ctx,
+    running: Arc<AtomicBool>,
+}
+
+impl Drop for JobEnd {
+    fn drop(&mut self) {
+        self.ctx.set_state(State::Idle);
+        self.running.store(false, Ordering::SeqCst);
     }
 }
 
@@ -239,6 +263,13 @@ impl<T: Transcribe + Send + 'static> Controller<T> {
             Cmd::Quit => {
                 self.cancel_recording();
                 self.cancel_job();
+                // The cancel makes a running job stop within about 100 ms; wait a moment so its child processes are cleaned up.
+                for _ in 0..30 {
+                    if !self.job.as_ref().is_some_and(Job::is_running) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
                 self.ctx.emit(Event::Quit);
                 return false;
             }
@@ -315,23 +346,35 @@ impl<T: Transcribe + Send + 'static> Controller<T> {
         self.job = Some(job);
         self.ctx.set_state(State::Transcribing);
         std::thread::spawn(move || {
+            // Dropped last, also when this thread panics: back to Idle first, then the job counts as finished.
+            let _end = JobEnd { ctx: ctx.clone(), running };
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut stt = stt.lock().unwrap_or_else(|e| e.into_inner());
                 let mut hooks = Hooks {
-                    on_state: &mut |s| ctx.set_state(s),
+                    // After a cancel the stages are not shown any more (the bubble must not come back).
+                    on_state: &mut |s| {
+                        if !cancelled.load(Ordering::SeqCst) {
+                            ctx.set_state(s)
+                        }
+                    },
                     hide_bubble: &mut || ctx.emit(Event::HideBubble),
                     cancelled: &cancelled,
                     delays: (FOCUS_RETURN_DELAY, PASTE_DELAY),
                 };
                 finish(&cfg, &mut *stt, &SystemOutput, &samples, &mut hooks)
             }));
-            match outcome {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => ctx.fail("Dictation failed", &format!("{e:#}")),
-                Err(_) => ctx.fail("Dictation failed", "internal error - see the daemon log"),
+            let failure = match outcome {
+                Ok(Ok(_)) => None,
+                Ok(Err(e)) if cancelled.load(Ordering::SeqCst) => {
+                    eprintln!("dictee: cancelled job ended: {e:#}"); // not an error for the user
+                    None
+                }
+                Ok(Err(e)) => Some(format!("{e:#}")),
+                Err(_) => Some("internal error - see the daemon log".to_string()),
+            };
+            if let Some(detail) = failure {
+                ctx.fail("Dictation failed", &detail);
             }
-            running.store(false, Ordering::SeqCst);
-            ctx.set_state(State::Idle);
         });
     }
 }
@@ -443,7 +486,7 @@ mod tests {
     #[test]
     fn states_are_reported_in_order() {
         let mut seen = Vec::new();
-        process(&Config::default(), &mut FakeStt("x"), &[0.1], |s| seen.push(s)).unwrap();
+        process(&Config::default(), &mut FakeStt("x"), &[0.1], |s| seen.push(s), &AtomicBool::new(false)).unwrap();
         assert_eq!(seen, vec![State::Transcribing]);
     }
 }

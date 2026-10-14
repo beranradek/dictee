@@ -56,7 +56,14 @@ impl Ui {
             Event::Level(l) => self.bubble.set_level(l),
             Event::HideBubble => self.bubble.set_state(State::Idle),
             Event::ShowSettings => self.show_settings(),
-            Event::Quit => self.app.quit(),
+            Event::Quit => {
+                // Closing the window flushes a change made less than the save delay ago.
+                let window = RefCell::borrow(&self.settings).clone();
+                if let Some(w) = window {
+                    w.close();
+                }
+                self.app.quit()
+            }
         }
     }
 

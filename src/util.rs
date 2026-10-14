@@ -31,6 +31,13 @@ pub fn isolate(cmd: &mut Command) {
     die_with_parent(cmd);
 }
 
+/// True when the child has ended but is not reaped yet (so its process group id is still reserved and safe to signal).
+pub fn exited_unreaped(child: &Child) -> bool {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::waitid(libc::P_PID, child.id(), &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) };
+    rc == 0 && unsafe { info.si_pid() } != 0
+}
+
 /// Kills a child started with `isolate` together with everything it started, and reaps it.
 pub fn kill_tree(child: &mut Child) {
     unsafe {
@@ -121,6 +128,19 @@ mod tests {
         let mut isolated = cmd.spawn().unwrap();
         kill_tree(&mut isolated);
         assert!(isolated.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn exited_unreaped_sees_a_finished_child_without_reaping_it() {
+        let mut child = Command::new("true").spawn().unwrap();
+        for _ in 0..100 {
+            if exited_unreaped(&child) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(exited_unreaped(&child));
+        assert!(child.wait().unwrap().success(), "still reapable afterwards");
     }
 
     #[test]

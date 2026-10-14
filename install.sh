@@ -29,3 +29,7 @@ printf '%s\n' "${template//@BIN@ settings/"$quoted" settings}" > "$app"
 printf '%s\n' "${template//@BIN@ settings/"$quoted" daemon}" > "$auto"   # autostart: daemon without a window
 update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
 echo "Installed. Start it: dictee settings   (download a model there, then set your shortcut)"
+case ":$PATH:" in
+  *":$HOME/.local/bin:"*) ;;
+  *) echo "Note: $HOME/.local/bin is not in your PATH yet. Log out and in again (Ubuntu adds it at login), or run: $bin settings" ;;
+esac

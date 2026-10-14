@@ -51,7 +51,8 @@ pub fn api_key(rw: &RewriteCfg) -> Result<Option<String>> {
     let file = rw.api_key_file.trim();
     if !file.is_empty() {
         let v = std::fs::read_to_string(file).with_context(|| format!("cannot read API key file {file}"))?;
-        return Ok(Some(v.trim().to_string()));
+        let key = v.trim().to_string();
+        return Ok(if key.is_empty() { None } else { Some(key) }); // an empty file is "no key", never "Bearer "
     }
     Ok(None)
 }

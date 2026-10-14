@@ -5,6 +5,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
@@ -58,12 +59,12 @@ impl Session {
     }
 
     /// Sends a request and waits for its response; other messages before it are ignored.
-    fn request(&mut self, method: &str, params: Value, deadline: Instant) -> Result<Value> {
+    fn request(&mut self, method: &str, params: Value, deadline: Instant, cancel: &AtomicBool) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
         self.send(&json!({"method": method, "id": id, "params": params}))?;
         loop {
-            let msg = self.recv(deadline)?;
+            let msg = self.recv(deadline, cancel)?;
             if msg.get("method").is_some() && msg.get("id").is_some() {
                 self.refuse(&msg)?;
                 bail!("Codex asked for something outside text-only rewriting ({})", msg["method"]);
@@ -81,12 +82,21 @@ impl Session {
         self.send(&json!({"id": request["id"], "error": {"code": -32601, "message": "not supported"}}))
     }
 
-    fn recv(&mut self, deadline: Instant) -> Result<Value> {
-        let left = deadline.saturating_duration_since(Instant::now());
-        match self.rx.recv_timeout(left) {
-            Ok(v) => Ok(v),
-            Err(RecvTimeoutError::Timeout) => bail!("Codex app-server timed out"),
-            Err(RecvTimeoutError::Disconnected) => bail!("Codex app-server exited"),
+    /// Waits for the next message in short slices, so a cancel is noticed within 100 ms.
+    fn recv(&mut self, deadline: Instant, cancel: &AtomicBool) -> Result<Value> {
+        loop {
+            if cancel.load(Ordering::SeqCst) {
+                bail!("cancelled");
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                bail!("Codex app-server timed out");
+            }
+            match self.rx.recv_timeout(left.min(Duration::from_millis(100))) {
+                Ok(v) => return Ok(v),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => bail!("Codex app-server exited"),
+            }
         }
     }
 }
@@ -128,18 +138,19 @@ fn spawn(cwd: &std::path::Path) -> Result<Session> {
 }
 
 /// Runs one text transformation. `model` may be empty (Codex default model).
-pub fn run(model: &str, prompt: &str, timeout: Duration) -> Result<String> {
+pub fn run(model: &str, prompt: &str, timeout: Duration, cancel: &AtomicBool) -> Result<String> {
     let dir = tempfile::tempdir()?; // private working directory, removed on every exit path
-    run_in(dir.path(), model, prompt, timeout)
+    run_in(dir.path(), model, prompt, timeout, cancel)
 }
 
-fn run_in(dir: &std::path::Path, model: &str, prompt: &str, timeout: Duration) -> Result<String> {
+fn run_in(dir: &std::path::Path, model: &str, prompt: &str, timeout: Duration, cancel: &AtomicBool) -> Result<String> {
     let deadline = Instant::now() + timeout;
     let mut s = spawn(dir)?;
     s.request(
         "initialize",
         json!({"clientInfo": {"name": "dictee", "title": "Dictee", "version": env!("CARGO_PKG_VERSION")}, "capabilities": {"experimentalApi": true}}),
         deadline,
+        cancel,
     )?;
     s.send(&json!({"method": "initialized", "params": {}}))?;
     let mut thread = json!({
@@ -149,20 +160,20 @@ fn run_in(dir: &std::path::Path, model: &str, prompt: &str, timeout: Duration) -
     if !model.is_empty() {
         thread["model"] = json!(model);
     }
-    let started = s.request("thread/start", thread, deadline)?;
+    let started = s.request("thread/start", thread, deadline, cancel)?;
     if started["thread"]["ephemeral"] != json!(true) {
         bail!("Codex cannot confirm an ephemeral text-only thread - update Codex");
     }
     let thread_id = started["thread"]["id"].as_str().context("Codex returned no thread id")?.to_string();
-    let turn = s.request("turn/start", json!({"threadId": thread_id, "input": [{"type": "text", "text": prompt}]}), deadline)?;
+    let turn = s.request("turn/start", json!({"threadId": thread_id, "input": [{"type": "text", "text": prompt}]}), deadline, cancel)?;
     let turn_id = turn["turn"]["id"].as_str().context("Codex returned no turn id")?.to_string();
-    collect(&mut s, &turn_id, deadline)
+    collect(&mut s, &turn_id, deadline, cancel)
 }
 
-fn collect(s: &mut Session, turn_id: &str, deadline: Instant) -> Result<String> {
+fn collect(s: &mut Session, turn_id: &str, deadline: Instant, cancel: &AtomicBool) -> Result<String> {
     let mut out = String::new();
     loop {
-        let msg = s.recv(deadline)?;
+        let msg = s.recv(deadline, cancel)?;
         if msg.get("method").is_some() && msg.get("id").is_some() {
             s.refuse(&msg)?;
             bail!("Codex asked for something outside text-only rewriting ({})", msg["method"]);
@@ -212,7 +223,7 @@ mod tests {
             tx.send(m).unwrap();
         }
         let mut s = Session { child, stdin, rx, next_id: 1 };
-        assert_eq!(collect(&mut s, "t1", Instant::now() + Duration::from_secs(2)).unwrap(), "Hello world");
+        assert_eq!(collect(&mut s, "t1", Instant::now() + Duration::from_secs(2), &AtomicBool::new(false)).unwrap(), "Hello world");
     }
 
     #[test]
@@ -222,6 +233,6 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         tx.send(json!({"method":"turn/completed","params":{"turn":{"id":"t1","status":"failed"}}})).unwrap();
         let mut s = Session { child, stdin, rx, next_id: 1 };
-        assert!(collect(&mut s, "t1", Instant::now() + Duration::from_secs(2)).is_err());
+        assert!(collect(&mut s, "t1", Instant::now() + Duration::from_secs(2), &AtomicBool::new(false)).is_err());
     }
 }

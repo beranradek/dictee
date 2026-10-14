@@ -66,42 +66,50 @@ impl<E: Into<anyhow::Error>> From<E> for Failure {
 }
 
 /// Downloads `url` to `target` through a `.part` file (resuming after a failure), checks SHA-256, reports `(done, total)` bytes.
-/// `max_size` is the expected size: a longer body is rejected instead of filling the disk.
+/// `max_size` is the expected size: a longer body is rejected instead of filling the disk, a shorter one is resumed.
+/// The lock on the partial file is held until the finished file is in place.
 pub fn fetch(url: &str, target: &Path, expected_sha256: &str, max_size: u64, mut progress: impl FnMut(u64, u64)) -> Result<()> {
     if let Some(dir) = target.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let part = part_path(target);
     let agent = agent();
-    let mut last_error = None;
-    for attempt in 1..=MAX_ATTEMPTS {
-        match attempt_download(&agent, url, &part, max_size, &mut progress) {
-            Ok(()) => {
+    let mut failures = 0;
+    loop {
+        let before = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+        let error = match attempt_download(&agent, url, &part, max_size, &mut progress) {
+            Ok(file) if file.metadata()?.len() == max_size => {
                 let got = sha256_of(&part)?;
                 if got != expected_sha256 {
                     let _ = std::fs::remove_file(&part);
                     bail!("checksum mismatch for {url} (expected {expected_sha256}, got {got})");
                 }
                 std::fs::rename(&part, target)?;
-                return Ok(());
+                return Ok(()); // `file` (and its lock) is released here, after the rename
             }
+            // The server ended the body early: keep the good part and continue from there.
+            Ok(_) => anyhow::anyhow!("the server closed the connection before the end of the file"),
             Err(Failure::Permanent(e)) => return Err(e).with_context(|| format!("download failed: {url}")),
-            Err(Failure::Retry(e)) => {
-                last_error = Some(e);
-                std::thread::sleep(Duration::from_secs(u64::from(attempt) * 2));
-            }
+            Err(Failure::Retry(e)) => e,
+        };
+        // Attempts that made progress do not count: a slow link may need many rounds, a dead server only a few.
+        let after = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+        failures = if after > before { 1 } else { failures + 1 };
+        if failures >= MAX_ATTEMPTS {
+            return Err(error).with_context(|| format!("download failed: {url}"));
         }
+        std::thread::sleep(Duration::from_secs(u64::from(failures) * 2));
     }
-    Err(last_error.expect("at least one attempt")).with_context(|| format!("download failed: {url}"))
 }
 
+/// One download attempt. Returns the (locked) partial file; the caller checks its length and checksum.
 fn attempt_download(
     agent: &ureq::Agent,
     url: &str,
     part: &Path,
     max_size: u64,
     progress: &mut impl FnMut(u64, u64),
-) -> Result<(), Failure> {
+) -> Result<std::fs::File, Failure> {
     use std::os::fd::AsRawFd;
     let permanent = |msg: &str| Failure::Permanent(anyhow::anyhow!("{msg}"));
     let mut file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(part)?;
@@ -120,7 +128,13 @@ fn attempt_download(
     }
     let response = match request.call() {
         Ok(r) => r,
-        Err(ureq::Error::StatusCode(416)) => return Ok(()), // the partial file is already complete
+        Err(ureq::Error::StatusCode(416)) => {
+            if have == max_size {
+                return Ok(file); // the partial file is already complete
+            }
+            file.set_len(0)?;
+            return Err(Failure::Retry(anyhow::anyhow!("server refused the byte range")));
+        }
         // Client errors will not go away by waiting (404, 403 ...), except timeouts and rate limits.
         Err(ureq::Error::StatusCode(code)) if (400..500).contains(&code) && code != 408 && code != 429 => {
             return Err(Failure::Permanent(anyhow::anyhow!("server answered HTTP {code}")));
@@ -144,7 +158,14 @@ fn attempt_download(
     let mut body = response.into_body().into_reader();
     let mut buf = vec![0u8; 256 * 1024];
     loop {
-        let n = body.read(&mut buf)?;
+        // A read error after some bytes keeps what arrived; the next attempt resumes from there.
+        let n = match body.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) => {
+                let _ = file.flush();
+                return Err(Failure::Retry(e.into()));
+            }
+        };
         if n == 0 {
             break;
         }
@@ -157,7 +178,7 @@ fn attempt_download(
         progress(done, total);
     }
     file.flush()?;
-    Ok(())
+    Ok(file)
 }
 
 pub fn sha256_of(path: &Path) -> Result<String> {
@@ -257,6 +278,38 @@ mod tests {
         assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
         let err = fetch(&serve(CONTENT), &target, &sha(CONTENT), 100_000, |_, _| {}).unwrap_err();
         assert!(format!("{err:#}").contains("already downloading"));
+    }
+
+    #[test]
+    fn short_body_keeps_the_partial_file_and_is_resumed() {
+        // First request: the server announces the full length but closes after 30000 bytes. Second: serves the rest.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for (i, mut stream) in listener.incoming().flatten().enumerate() {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let (mut start, mut line) = (0usize, String::new());
+                while reader.read_line(&mut line).is_ok() && line.trim() != "" {
+                    if let Some(r) = line.to_lowercase().strip_prefix("range: bytes=") {
+                        start = r.trim().trim_end_matches('-').parse().unwrap_or(0);
+                    }
+                    line.clear();
+                }
+                let body = &CONTENT[start..];
+                let (status, range) = if start > 0 {
+                    ("206 Partial Content", format!("Content-Range: bytes {start}-{}/{}\r\n", CONTENT.len() - 1, CONTENT.len()))
+                } else {
+                    ("200 OK", String::new())
+                };
+                let head = format!("HTTP/1.1 {status}\r\n{range}Content-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(if i == 0 { &body[..30_000] } else { body }); // the first answer is cut short
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("f.bin");
+        fetch(&format!("http://127.0.0.1:{port}/f.bin"), &target, &sha(CONTENT), 100_000, |_, _| {}).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), CONTENT);
     }
 
     #[test]

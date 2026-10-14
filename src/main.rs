@@ -108,7 +108,7 @@ fn transcribe(file: &std::path::Path, rewrite: bool) -> Result<()> {
         cfg.rewrite.engine = "none".into();
     }
     let samples = audio::read_wav(file)?;
-    let out = controller::process(&cfg, &mut stt::Stt::default(), &samples, |_| {})?;
+    let out = controller::process(&cfg, &mut stt::Stt::default(), &samples, |_| {}, &std::sync::atomic::AtomicBool::new(false))?;
     if let Some(e) = &out.rewrite_error {
         eprintln!("rewrite failed: {e}");
     }

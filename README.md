@@ -31,7 +31,7 @@ dictee settings
 ```
 
 Build needs: Rust, cmake, a C++ compiler, libclang, GTK 4 and libadwaita dev files. Runtime needs: PipeWire (`pw-record`, `pw-dump`),
-`wl-clipboard` (or `xclip` on X11), `notify-send` (libnotify). Qwen3-ASR downloads its own `llama-server` (about 17 MB CPU or 30 MB Vulkan) on first use. For auto-paste also `ydotool` (running `ydotoold`, access to `/dev/uinput`).
+`wl-clipboard` (or `xclip` / `xsel`), `notify-send` (libnotify). Qwen3-ASR downloads its own `llama-server` (about 17 MB CPU or 30 MB Vulkan) on first use. For auto-paste also `ydotool` (running `ydotoold`, access to `/dev/uinput`).
 
 1. Open **Dictee** from the app menu, choose the speech engine and download a model (Whisper Small is the default; Qwen3-ASR 1.7B Q4
    is Mluva's recommended model and about 1.6 GB).
@@ -49,7 +49,8 @@ Config: `~/.config/dictee/config.toml`. Models: `~/.local/share/dictee/models` (
 - A recording stops by itself after 15 minutes.
 - Model downloads are pinned to a fixed commit and SHA-256, have timeouts, and resume after a failure.
 - A rewrite reply is checked before it is used: control characters are removed, and a reply that is much longer than what was said
-  (for example an LLM that followed instructions hidden in the audio) is rejected and the raw text is used instead.
+  (for example an LLM that followed instructions hidden in the audio) or that shares almost nothing with it is rejected and the raw text
+  is used instead. This lowers the risk, it does not remove it: keep auto-paste off in terminals if untrusted audio is possible.
 - Errors (missing model, microphone not connected, invalid `config.toml`) show as a desktop notification and in the daemon log.
 - Privacy: with a rewrite engine on, the transcript and your phrase list go to that engine (the CLI's service or your API server).
   The default phrases are generic tech terms; add your own names in Settings.

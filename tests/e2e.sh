@@ -49,7 +49,7 @@ setkey() { sed -i "s|^$1 = .*|$1 = \"$2\"|" "$cfg"; }                      # top
 setrw() { sed -i "/^\[rewrite\]/,\$ s|^$1 = .*|$1 = \"$2\"|" "$cfg"; }      # keys of the [rewrite] section
 
 check() { # name wav expected-regex
-  wl-copy ""; "$BIN" start >/dev/null || { echo "FAIL $1: cannot start"; fail=1; return; }
+  wl-copy --clear; "$BIN" start >/dev/null || { echo "FAIL $1: cannot start"; fail=1; return; }
   sleep 0.5; pw-play --target dictee-test-sink "$AUDIO/$2"; sleep 0.5
   "$BIN" stop >/dev/null
   for _ in $(seq 1 240); do [ "$("$BIN" status)" = idle ] && break; sleep 0.5; done

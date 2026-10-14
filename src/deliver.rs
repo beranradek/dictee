@@ -8,15 +8,18 @@ use std::process::{Command, Stdio};
 pub fn copy(text: &str) -> Result<()> {
     let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
     // An explicit text type: without it wl-copy guesses from the content and may offer e.g. "#!/bin/sh" as a non-text type.
-    let candidates: &[(&str, &[&str])] = if wayland {
-        &[("wl-copy", &["--type", "text/plain;charset=utf-8"])]
-    } else {
-        &[("xclip", &["-selection", "clipboard", "-t", "UTF8_STRING"]), ("xsel", &["--clipboard", "--input"])]
-    };
+    let wl_copy: (&str, &[&str]) = ("wl-copy", &["--type", "text/plain;charset=utf-8"]);
+    let x11: [(&str, &[&str]); 2] = [("xclip", &["-selection", "clipboard", "-t", "UTF8_STRING"]), ("xsel", &["--clipboard", "--input"])];
+    // On Wayland the X11 tools are a fallback (XWayland): a machine with only xclip installed still works.
+    let candidates: Vec<(&str, &[&str])> = if wayland { std::iter::once(wl_copy).chain(x11).collect() } else { x11.to_vec() };
     for (bin, args) in candidates {
-        match Command::new(bin).args(*args).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+        match Command::new(bin).args(args).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
             Ok(mut child) => {
-                child.stdin.take().unwrap().write_all(text.as_bytes())?;
+                if let Err(e) = child.stdin.take().unwrap().write_all(text.as_bytes()) {
+                    let _ = child.kill();
+                    let _ = child.wait(); // no zombie
+                    return Err(e).with_context(|| format!("cannot write to {bin}"));
+                }
                 // wl-copy/xclip stay alive as clipboard owners; reaping in a thread avoids zombies.
                 std::thread::spawn(move || {
                     let _ = child.wait();

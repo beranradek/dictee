@@ -162,6 +162,8 @@ impl Config {
             options::REWRITE_ENGINES,
         )?;
         check(options::contains(options::DEVICES, &self.qwen.device), "qwen.device", &self.qwen.device, options::DEVICES)?;
+        crate::models::find(&self.model)?;
+        crate::qwen::find(&self.qwen.model)?;
         if options::language(&self.language).is_none() {
             let list: Vec<&str> = options::LANGUAGES.iter().map(|l| l.choice.id).collect();
             bail!("invalid language '{}' (allowed: {})", self.language, list.join(", "));
@@ -189,6 +191,8 @@ impl Config {
                 let mut cfg: Self = toml::from_str(&text).with_context(|| format!("invalid config {}", path.display()))?;
                 cfg.threads = cfg.threads.clamp(1, 64);
                 cfg.qwen.threads = cfg.qwen.threads.clamp(0, 64);
+                cfg.rewrite.timeout_secs = cfg.rewrite.timeout_secs.clamp(5, 3600); // a huge value would overflow the deadline
+                cfg.qwen.keep_alive_secs = cfg.qwen.keep_alive_secs.min(24 * 3600);
                 cfg.validate().with_context(|| format!("invalid config {}", path.display()))?;
                 Ok(cfg)
             }
@@ -327,9 +331,22 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip() {
+    fn defaults_are_valid_and_point_to_existing_models() {
         let cfg = Config::default();
-        assert_eq!(toml::from_str::<Config>(&toml::to_string_pretty(&cfg).unwrap()).unwrap(), cfg);
+        cfg.validate().unwrap();
+        assert!(crate::models::find(&cfg.model).is_ok() && crate::qwen::find(&cfg.qwen.model).is_ok());
+        let mut bad = cfg.clone();
+        bad.model = "no-such-model".into();
+        assert!(bad.validate().is_err(), "unknown model ids are rejected, not silently replaced in the UI");
+    }
+
+    #[test]
+    fn extreme_timeouts_are_clamped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.toml");
+        std::fs::write(&path, "[rewrite]\ntimeout_secs = 9223372036854775807\n[qwen]\nkeep_alive_secs = 99999999\n").unwrap();
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!((cfg.rewrite.timeout_secs, cfg.qwen.keep_alive_secs), (3600, 86400));
     }
 
     #[test]

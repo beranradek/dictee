@@ -78,7 +78,7 @@ impl Form {
             qwen_keep: adw::SpinRow::with_range(0.0, 3600.0, 30.0),
             models_dir: entry("Models folder (empty = default)"),
             lang: combo("Language", &lang_choices),
-            threads: adw::SpinRow::with_range(1.0, 32.0, 1.0),
+            threads: adw::SpinRow::with_range(1.0, 64.0, 1.0),
             paste: switch("Paste automatically", "Needs ydotoold and access to /dev/uinput. Off = copy only, paste yourself"),
             paste_keys: combo("Paste keys", options::PASTE_KEYS),
             notify: switch("Show notification when text is copied", ""),
@@ -130,6 +130,10 @@ impl Form {
         self.rw_extra.set_text(&cfg.rewrite.extra_instructions);
         self.phrases.set_text(&cfg.phrases.join("\n"));
         self.busy.set(false);
+        // The widgets normalise some values (ranges, trimmed or cleaned text). The baseline is what they show, so that only a
+        // change the user makes counts as a change and untouched file values are never rewritten.
+        let shown = self.snapshot();
+        *self.baseline.borrow_mut() = shown;
         self.refresh(&cfg.models_path());
     }
 
