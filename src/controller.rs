@@ -85,7 +85,7 @@ pub fn run(rx: Receiver<Cmd>, ui: Sender<Event>, shared: SharedState) {
         let recording = recorder.is_some();
         match cmd {
             Cmd::Toggle if recording => stop(&mut recorder, &mut stt, &ui, &set),
-            Cmd::Toggle | Cmd::Start if !recording => match start() {
+            Cmd::Toggle | Cmd::Start if !recording => match start(&mut stt) {
                 Ok(r) => {
                     let _ = ui.send(Event::Level(r.level()));
                     recorder = Some(r);
@@ -118,9 +118,11 @@ pub fn run(rx: Receiver<Cmd>, ui: Sender<Event>, shared: SharedState) {
     }
 }
 
-fn start() -> Result<Recorder> {
+fn start(stt: &mut Stt) -> Result<Recorder> {
     let cfg = Config::load()?;
-    Recorder::start(&cfg.mic)
+    let recorder = Recorder::start(&cfg.mic)?;
+    stt.prewarm(&cfg);
+    Ok(recorder)
 }
 
 fn stop(recorder: &mut Option<Recorder>, stt: &mut Stt, ui: &Sender<Event>, set: &impl Fn(State)) {

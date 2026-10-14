@@ -6,7 +6,8 @@ use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-pub fn build_prompt(cfg: &Config, transcript: &str) -> String {
+/// Instructions without the transcript (used as system message by the API engine).
+pub fn instructions(cfg: &Config) -> String {
     let phrases = cfg.clean_phrases();
     let mut p = String::from(
         "You are a post-processor for speech-to-text dictation. The transcript below may be Czech or English.\n\
@@ -23,10 +24,16 @@ pub fn build_prompt(cfg: &Config, transcript: &str) -> String {
         p.push_str(cfg.rewrite.extra_instructions.trim());
         p.push('\n');
     }
-    p.push_str("Reply with ONLY the corrected text, no quotes or comments.\n\nTranscript:\n<<<\n");
-    p.push_str(transcript);
-    p.push_str("\n>>>\n");
+    p.push_str("Reply with ONLY the corrected text, no quotes or comments.\n");
     p
+}
+
+fn transcript_block(transcript: &str) -> String {
+    format!("Transcript:\n<<<\n{transcript}\n>>>\n")
+}
+
+pub fn build_prompt(cfg: &Config, transcript: &str) -> String {
+    format!("{}\n{}", instructions(cfg), transcript_block(transcript))
 }
 
 /// Builds the CLI command; the prompt goes through stdin.
@@ -55,6 +62,14 @@ fn command(rw: &RewriteCfg, out_file: &std::path::Path) -> Result<Command> {
 
 /// Rewrites the transcript. Callers should fall back to the raw text on error.
 pub fn rewrite(cfg: &Config, transcript: &str) -> Result<String> {
+    match cfg.rewrite.engine.as_str() {
+        "openai" => return crate::rewrite_api::chat(&cfg.rewrite, &instructions(cfg), &transcript_block(transcript)),
+        "codex-app" => {
+            let timeout = Duration::from_secs(cfg.rewrite.timeout_secs.max(5));
+            return crate::codex_app::run(cfg.rewrite.model.trim(), &build_prompt(cfg, transcript), timeout);
+        }
+        _ => {}
+    }
     let dir = tempfile_dir()?;
     let out_file = dir.join("out.txt");
     let mut cmd = command(&cfg.rewrite, &out_file)?;

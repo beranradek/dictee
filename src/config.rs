@@ -7,18 +7,54 @@ use std::path::PathBuf;
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct RewriteCfg {
-    /// "none", "claude" or "codex"
+    /// "none", "claude" (CLI), "codex" (CLI exec), "codex-app" (Codex app-server) or "openai" (OpenAI/LiteLLM compatible API)
     pub engine: String,
     /// Optional model name passed to the CLI (empty = CLI default)
     pub model: String,
     pub timeout_secs: u64,
     /// Extra free-text instructions appended to the rewrite prompt
     pub extra_instructions: String,
+    /// Chat API base URL including the API prefix, e.g. "http://localhost:4000/v1" (LiteLLM) or "https://api.openai.com/v1"
+    pub base_url: String,
+    /// Name of the environment variable that holds the API key (empty = no key)
+    pub api_key_env: String,
+    /// Alternative: file containing the API key (used when the variable is empty or unset)
+    pub api_key_file: String,
 }
 
 impl Default for RewriteCfg {
     fn default() -> Self {
-        Self { engine: "none".into(), model: String::new(), timeout_secs: 60, extra_instructions: String::new() }
+        Self {
+            engine: "none".into(),
+            model: String::new(),
+            timeout_secs: 60,
+            extra_instructions: String::new(),
+            base_url: "http://localhost:4000/v1".into(),
+            api_key_env: "OPENAI_API_KEY".into(),
+            api_key_file: String::new(),
+        }
+    }
+}
+
+/// Settings for Qwen3-ASR running on a managed llama.cpp `llama-server`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct QwenCfg {
+    /// Model id from `qwen::MODELS`
+    pub model: String,
+    /// "cpu" or "vulkan" (any Vulkan GPU, experimental)
+    pub device: String,
+    /// Own llama-server binary (empty = managed download of the pinned release)
+    pub server_path: String,
+    /// Keep the server (and model in RAM) this long after the last dictation; 0 = stop right away
+    pub keep_alive_secs: u64,
+    /// Threads for the server; 0 = same as the Whisper thread setting
+    pub threads: i32,
+}
+
+impl Default for QwenCfg {
+    fn default() -> Self {
+        Self { model: "qwen3-1.7b-q4".into(), device: "cpu".into(), server_path: String::new(), keep_alive_secs: 120, threads: 0 }
     }
 }
 
@@ -27,6 +63,8 @@ impl Default for RewriteCfg {
 pub struct Config {
     /// PipeWire node name of the microphone; empty = system default
     pub mic: String,
+    /// Speech engine: "whisper" (whisper.cpp) or "qwen" (Qwen3-ASR on llama.cpp)
+    pub stt_engine: String,
     /// Folder for downloaded models; empty = `~/.local/share/dictee/models`
     pub models_dir: String,
     /// Model id from `models::MODELS`
@@ -45,6 +83,7 @@ pub struct Config {
     pub notify: bool,
     /// Show the floating bubble while dictating (it takes keyboard focus on GNOME Wayland while visible)
     pub show_bubble: bool,
+    pub qwen: QwenCfg,
     pub rewrite: RewriteCfg,
     /// Known names and phrases, given to the STT model and the rewrite LLM
     pub phrases: Vec<String>,
@@ -55,6 +94,7 @@ impl Default for Config {
         let threads = std::thread::available_parallelism().map(|n| n.get() as i32).unwrap_or(4).clamp(2, 8);
         Self {
             mic: String::new(),
+            stt_engine: "whisper".into(),
             models_dir: String::new(),
             model: "small".into(),
             language: "auto".into(),
@@ -65,6 +105,7 @@ impl Default for Config {
             paste_keys: "ctrl+v".into(),
             notify: true,
             show_bubble: true,
+            qwen: QwenCfg::default(),
             rewrite: RewriteCfg::default(),
             phrases: [
                 "Etnetera", "Radek Beran", "Claude Code", "Codex", "GitHub", "GitLab", "Kubernetes", "Docker", "Keycloak",

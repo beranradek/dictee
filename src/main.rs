@@ -1,10 +1,14 @@
 mod audio;
+mod codex_app;
 mod config;
 mod controller;
 mod deliver;
+mod download;
 mod ipc;
 mod models;
+mod qwen;
 mod rewrite;
+mod rewrite_api;
 mod shortcut;
 mod stt;
 mod ui;
@@ -77,17 +81,29 @@ fn main() -> Result<()> {
         Some(Cmd::Models { download }) => {
             if let Some(id) = download {
                 let mut last = 0;
-                models::download(&id, |d, t| {
+                let mut report = |d: u64, t: u64| {
                     let pct = if t > 0 { d * 100 / t } else { 0 };
                     if pct != last {
                         last = pct;
                         eprint!("\r{pct}%");
                     }
-                })?;
+                };
+                if qwen::find(&id).is_ok() {
+                    let mut q = config::Config::load()?.qwen;
+                    q.model = id;
+                    qwen::download_all(&q, &mut report)?;
+                } else {
+                    models::download(&id, &mut report)?;
+                }
                 eprintln!("\ndone");
             }
+            println!("Whisper (stt_engine = \"whisper\"):");
             for m in models::MODELS {
-                println!("{}\t{}\t{} MB\t{}", m.id, if models::is_downloaded(m.id) { "downloaded" } else { "-" }, m.size_mb, m.label);
+                println!("  {}\t{}\t{} MB\t{}", m.id, if models::is_downloaded(m.id) { "downloaded" } else { "-" }, m.size_mb, m.label);
+            }
+            println!("Qwen3-ASR on llama.cpp (stt_engine = \"qwen\"):");
+            for m in qwen::MODELS {
+                println!("  {}\t{}\t{} MB\t{}", m.id, if qwen::model_ready(m.id) { "downloaded" } else { "-" }, m.total_mb(), m.label);
             }
         }
         None | Some(Cmd::Daemon) => daemon(false)?,

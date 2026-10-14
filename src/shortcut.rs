@@ -62,6 +62,140 @@ async fn run(tx: Sender<Cmd>, status: Status) -> Result<()> {
     Ok(())
 }
 
+/// A shortcut like "CTRL+SHIFT+h" in the portal notation, convertible to GNOME and KDE notation.
+#[derive(Debug, PartialEq)]
+pub struct Combo {
+    mods: Vec<&'static str>, // canonical: Ctrl, Shift, Alt, Super
+    key: String,
+}
+
+impl Combo {
+    pub fn parse(text: &str) -> Result<Self> {
+        let mut mods = Vec::new();
+        let mut key = None;
+        for part in text.split('+').map(str::trim).filter(|p| !p.is_empty()) {
+            match part.to_ascii_uppercase().as_str() {
+                "CTRL" | "CONTROL" => mods.push("Ctrl"),
+                "SHIFT" => mods.push("Shift"),
+                "ALT" => mods.push("Alt"),
+                "LOGO" | "SUPER" | "META" => mods.push("Super"),
+                _ if key.is_none() => key = Some(part.to_string()),
+                _ => anyhow::bail!("shortcut '{text}' has more than one key"),
+            }
+        }
+        let key = key.with_context(|| format!("shortcut '{text}' has no key"))?;
+        if mods.is_empty() {
+            anyhow::bail!("shortcut '{text}' needs a modifier (Ctrl, Shift, Alt or Super)");
+        }
+        Ok(Self { mods, key })
+    }
+
+    /// `<Control><Shift>h`
+    pub fn gnome(&self) -> String {
+        let mods: String = self.mods.iter().map(|m| match *m { "Ctrl" => "<Control>", "Shift" => "<Shift>", "Alt" => "<Alt>", _ => "<Super>" }).collect();
+        format!("{mods}{}", self.key.to_lowercase())
+    }
+
+    /// `Ctrl+Shift+H`
+    pub fn kde(&self) -> String {
+        let mods: Vec<&str> = self.mods.iter().map(|m| if *m == "Super" { "Meta" } else { *m }).collect();
+        let key = if self.key.chars().count() == 1 { self.key.to_uppercase() } else { self.key.clone() };
+        format!("{}+{key}", mods.join("+"))
+    }
+
+    /// `Ctrl+Shift+H` for display
+    pub fn display(&self) -> String {
+        self.kde().replace("Meta", "Super")
+    }
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum Desktop {
+    Gnome,
+    Kde,
+    Other,
+}
+
+pub fn desktop() -> Desktop {
+    desktop_from(&std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default())
+}
+
+fn desktop_from(xdg: &str) -> Desktop {
+    let up = xdg.to_ascii_uppercase();
+    if up.split(':').any(|p| p == "KDE") {
+        Desktop::Kde
+    } else if up.split(':').any(|p| p == "GNOME" || p == "UNITY" || p == "X-CINNAMON" || p == "BUDGIE") {
+        Desktop::Gnome
+    } else {
+        Desktop::Other
+    }
+}
+
+/// Installs a "run `dictee toggle`" keybinding in the current desktop. Returns a message for the user.
+pub fn install_keybinding(shortcut: &str) -> Result<String> {
+    let combo = Combo::parse(shortcut)?;
+    match desktop() {
+        Desktop::Gnome => {
+            install_gnome_keybinding(&combo.gnome())?;
+            Ok(format!("GNOME keybinding {} installed", combo.display()))
+        }
+        Desktop::Kde => {
+            install_kde_keybinding(&combo.kde())?;
+            Ok(format!("KDE shortcut {} installed (log out and in if it does not react)", combo.display()))
+        }
+        Desktop::Other => anyhow::bail!("unknown desktop: add a custom shortcut running `{} toggle` in your system settings", std::env::current_exe()?.display()),
+    }
+}
+
+/// Content of the KDE launcher file that kglobalaccel binds the shortcut to.
+fn kde_desktop_file(exe: &std::path::Path) -> String {
+    format!(
+        "[Desktop Entry]\nType=Application\nName=Dictee toggle dictation\nExec={} toggle\nNoDisplay=true\n\
+         X-KDE-GlobalAccel-CommandShortcut=true\n",
+        exe.display()
+    )
+}
+
+/// Arguments for `kwriteconfig` that assign the shortcut to the launcher file.
+fn kde_config_args(binding: &str) -> Vec<String> {
+    ["--file", "kglobalshortcutsrc", "--group", "services", "--group", KDE_DESKTOP_ID, "--key", "_launch", binding].iter().map(|s| s.to_string()).collect()
+}
+
+const KDE_DESKTOP_ID: &str = "dictee-toggle.desktop";
+
+/// Registers a KDE global shortcut (Plasma 5 and 6) through a launcher file and `kglobalshortcutsrc`.
+/// Not tested on a real Plasma session by the author - report problems.
+pub fn install_kde_keybinding(binding: &str) -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let dir = dirs::data_dir().context("no data dir")?.join("applications");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join(KDE_DESKTOP_ID), kde_desktop_file(&exe))?;
+    let (writer, plasma6) = if which("kwriteconfig6") {
+        ("kwriteconfig6", true)
+    } else if which("kwriteconfig5") {
+        ("kwriteconfig5", false)
+    } else {
+        anyhow::bail!("kwriteconfig6/kwriteconfig5 not found (is KDE Plasma installed?)");
+    };
+    let status = Command::new(writer).args(kde_config_args(binding)).status().context("cannot run kwriteconfig")?;
+    if !status.success() {
+        anyhow::bail!("{writer} failed");
+    }
+    let _ = Command::new("kbuildsycoca6").arg("--noincremental").status();
+    // kglobalaccel reads kglobalshortcutsrc at start: restart it so the new shortcut is active.
+    let restarted = Command::new("systemctl").args(["--user", "restart", if plasma6 { "plasma-kglobalaccel.service" } else { "plasma-kglobalaccel5.service" }]).status().map(|s| s.success()).unwrap_or(false);
+    if !restarted {
+        let (quit, daemon) = if plasma6 { ("kquitapp6", "kglobalaccel6") } else { ("kquitapp5", "kglobalaccel5") };
+        let _ = Command::new(quit).arg(daemon).status();
+        let _ = Command::new(daemon).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn();
+    }
+    Ok(())
+}
+
+fn which(bin: &str) -> bool {
+    std::env::var_os("PATH").map(|p| std::env::split_paths(&p).any(|d| d.join(bin).is_file())).unwrap_or(false)
+}
+
 /// Registers a GNOME custom keybinding that runs `dictee toggle`. `binding` looks like `<Control><Shift>h`.
 pub fn install_gnome_keybinding(binding: &str) -> Result<()> {
     const SCHEMA: &str = "org.gnome.settings-daemon.plugins.media-keys";
@@ -88,4 +222,43 @@ pub fn install_gnome_keybinding(binding: &str) -> Result<()> {
         gs(&["set", SCHEMA, "custom-keybindings", &new])?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converts_notations() {
+        let c = Combo::parse("CTRL+SHIFT+h").unwrap();
+        assert_eq!(c.gnome(), "<Control><Shift>h");
+        assert_eq!(c.kde(), "Ctrl+Shift+H");
+        let c = Combo::parse("LOGO+ALT+space").unwrap();
+        assert_eq!(c.gnome(), "<Super><Alt>space");
+        assert_eq!(c.kde(), "Meta+Alt+space");
+        assert_eq!(c.display(), "Super+Alt+space");
+    }
+
+    #[test]
+    fn rejects_bad_shortcuts() {
+        assert!(Combo::parse("h").is_err());
+        assert!(Combo::parse("CTRL+").is_err());
+        assert!(Combo::parse("CTRL+a+b").is_err());
+    }
+
+    #[test]
+    fn detects_desktops() {
+        assert_eq!(desktop_from("ubuntu:GNOME"), Desktop::Gnome);
+        assert_eq!(desktop_from("KDE"), Desktop::Kde);
+        assert_eq!(desktop_from("Hyprland"), Desktop::Other);
+    }
+
+    #[test]
+    fn kde_files_and_args() {
+        let f = kde_desktop_file(std::path::Path::new("/usr/bin/dictee"));
+        assert!(f.contains("Exec=/usr/bin/dictee toggle") && f.contains("X-KDE-GlobalAccel-CommandShortcut=true"));
+        let a = kde_config_args("Ctrl+Shift+H");
+        assert_eq!(a.last().unwrap(), "Ctrl+Shift+H");
+        assert!(a.contains(&"dictee-toggle.desktop".to_string()));
+    }
 }

@@ -12,9 +12,21 @@ const MAX_PROMPT_CHARS: usize = 500;
 #[derive(Default)]
 pub struct Stt {
     loaded: Option<(String, WhisperContext)>,
+    qwen: Option<crate::qwen::Server>,
 }
 
 impl Stt {
+    fn qwen(&mut self) -> &crate::qwen::Server {
+        self.qwen.get_or_insert_with(crate::qwen::Server::new)
+    }
+
+    /// Called when a recording starts: lets a slow engine load while the user speaks.
+    pub fn prewarm(&mut self, cfg: &Config) {
+        if cfg.stt_engine == "qwen" {
+            self.qwen().prewarm(cfg.clone());
+        }
+    }
+
     fn context(&mut self, model: &str) -> Result<&WhisperContext> {
         if self.loaded.as_ref().map(|(id, _)| id.as_str()) != Some(model) {
             let path = models::path(model)?;
@@ -35,6 +47,9 @@ impl Stt {
     pub fn transcribe(&mut self, cfg: &Config, samples: &[f32]) -> Result<String> {
         if (samples.len() as f32) < crate::audio::SAMPLE_RATE as f32 * MIN_SECONDS {
             return Ok(String::new());
+        }
+        if cfg.stt_engine == "qwen" {
+            return Ok(clean_text(&self.qwen().transcribe(cfg, samples)?));
         }
         let prompt = build_prompt(&cfg.clean_phrases());
         let ctx = self.context(&cfg.model)?;
