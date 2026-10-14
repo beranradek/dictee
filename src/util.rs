@@ -70,6 +70,12 @@ fn strip_deleted(exe: PathBuf) -> PathBuf {
     }
 }
 
+/// A GVariant text-format string literal: `gsettings set` parses its value argument as GVariant, so a plain string with quotes
+/// or spaces inside (like a shell command) must be wrapped and escaped.
+pub fn gvariant_string(text: &str) -> String {
+    format!("'{}'", text.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
 /// Quotes for a POSIX shell (GNOME parses keybinding commands like that).
 pub fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
@@ -141,6 +147,13 @@ mod tests {
         }
         assert!(exited_unreaped(&child));
         assert!(child.wait().unwrap().success(), "still reapable afterwards");
+    }
+
+    #[test]
+    fn gvariant_strings_are_escaped() {
+        assert_eq!(gvariant_string("Dictee toggle"), "'Dictee toggle'");
+        assert_eq!(gvariant_string(&format!("{} toggle", shell_quote("/home/a b/dictee"))), r"'\'/home/a b/dictee\' toggle'");
+        assert_eq!(gvariant_string(r"a\b"), r"'a\\b'");
     }
 
     #[test]

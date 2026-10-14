@@ -239,9 +239,10 @@ pub fn install_gnome_keybinding(binding: &str) -> Result<()> {
     };
     let exe = util::exe_path()?;
     let key_schema = format!("{SCHEMA}.custom-keybinding:{PATH}");
-    gs(&["set", &key_schema, "name", "Dictee toggle"])?;
-    gs(&["set", &key_schema, "command", &format!("{} toggle", util::shell_quote(&exe.display().to_string()))])?;
-    gs(&["set", &key_schema, "binding", binding])?;
+    let command = format!("{} toggle", util::shell_quote(&exe.display().to_string()));
+    gs(&["set", &key_schema, "name", &util::gvariant_string("Dictee toggle")])?;
+    gs(&["set", &key_schema, "command", &util::gvariant_string(&command)])?;
+    gs(&["set", &key_schema, "binding", &util::gvariant_string(binding)])?;
     let current = gs(&["get", SCHEMA, "custom-keybindings"])?;
     if !current.contains(PATH) {
         let new = if current.contains('\'') {
