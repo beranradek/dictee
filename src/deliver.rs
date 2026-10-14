@@ -1,17 +1,14 @@
 //! Delivers the final text: clipboard, optional auto-paste, desktop notification.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::io::Write;
 use std::process::{Command, Stdio};
 
 /// Puts text on the clipboard. Uses wl-copy on Wayland, xclip/xsel on X11.
 pub fn copy(text: &str) -> Result<()> {
     let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
-    let candidates: &[(&str, &[&str])] = if wayland {
-        &[("wl-copy", &[])]
-    } else {
-        &[("xclip", &["-selection", "clipboard"]), ("xsel", &["--clipboard", "--input"])]
-    };
+    let candidates: &[(&str, &[&str])] =
+        if wayland { &[("wl-copy", &[])] } else { &[("xclip", &["-selection", "clipboard"]), ("xsel", &["--clipboard", "--input"])] };
     for (bin, args) in candidates {
         match Command::new(bin).args(*args).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
             Ok(mut child) => {
@@ -43,5 +40,5 @@ pub fn paste(keys: &str) -> Result<()> {
 }
 
 pub fn notify(title: &str, body: &str) {
-    let _ = Command::new("notify-send").args(["-a", "Dictee", "-t", "3000", title, body]).status();
+    let _ = Command::new("notify-send").args(["-a", "Dictee", "-t", "3000", "--", title, body]).status(); // "--": text may start with "-"
 }

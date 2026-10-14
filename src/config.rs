@@ -1,6 +1,7 @@
 //! User configuration stored as TOML in `~/.config/dictee/config.toml`.
 
-use anyhow::{Context, Result};
+use crate::options;
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -108,8 +109,20 @@ impl Default for Config {
             qwen: QwenCfg::default(),
             rewrite: RewriteCfg::default(),
             phrases: [
-                "Etnetera", "Radek Beran", "Claude Code", "Codex", "GitHub", "GitLab", "Kubernetes", "Docker", "Keycloak",
-                "Kotlin", "Spring Boot", "PostgreSQL", "Ubuntu", "Wayland", "PipeWire", "Dictee", "Mluva",
+                "Claude Code",
+                "Codex",
+                "GitHub",
+                "GitLab",
+                "Kubernetes",
+                "Docker",
+                "Keycloak",
+                "Kotlin",
+                "Spring Boot",
+                "PostgreSQL",
+                "Ubuntu",
+                "Wayland",
+                "PipeWire",
+                "Dictee",
             ]
             .iter()
             .map(|s| s.to_string())
@@ -119,19 +132,63 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Folder for downloaded models (`~` is expanded); the default is under the user data dir.
+    pub fn models_path(&self) -> PathBuf {
+        let configured = self.models_dir.trim();
+        if configured.is_empty() {
+            return dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("dictee").join("models");
+        }
+        match configured.strip_prefix("~/") {
+            Some(rest) => dirs::home_dir().unwrap_or_default().join(rest),
+            None => PathBuf::from(configured),
+        }
+    }
+
+    /// Rejects values the engines cannot work with, with a message that names the setting.
+    pub fn validate(&self) -> Result<()> {
+        let check = |ok: bool, name: &str, value: &str, allowed: &[options::Choice]| -> Result<()> {
+            if !ok {
+                let list: Vec<&str> = allowed.iter().map(|c| c.id).collect();
+                bail!("invalid {name} '{value}' (allowed: {})", list.join(", "));
+            }
+            Ok(())
+        };
+        check(options::contains(options::STT_ENGINES, &self.stt_engine), "stt_engine", &self.stt_engine, options::STT_ENGINES)?;
+        check(options::contains(options::PASTE_KEYS, &self.paste_keys), "paste_keys", &self.paste_keys, options::PASTE_KEYS)?;
+        check(
+            options::contains(options::REWRITE_ENGINES, &self.rewrite.engine),
+            "rewrite.engine",
+            &self.rewrite.engine,
+            options::REWRITE_ENGINES,
+        )?;
+        check(options::contains(options::DEVICES, &self.qwen.device), "qwen.device", &self.qwen.device, options::DEVICES)?;
+        if options::language(&self.language).is_none() {
+            let list: Vec<&str> = options::LANGUAGES.iter().map(|l| l.choice.id).collect();
+            bail!("invalid language '{}' (allowed: {})", self.language, list.join(", "));
+        }
+        Ok(())
+    }
+
     pub fn dir() -> PathBuf {
         dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("dictee")
     }
 
+    /// `$DICTEE_CONFIG` (tests, a second instance), else `~/.config/dictee/config.toml`.
     pub fn path() -> PathBuf {
-        Self::dir().join("config.toml")
+        std::env::var_os("DICTEE_CONFIG").map(PathBuf::from).unwrap_or_else(|| Self::dir().join("config.toml"))
     }
 
     /// Loads the config; a missing file gives (and writes) the defaults, a broken file is an error.
     pub fn load() -> Result<Self> {
         let path = Self::path();
         match std::fs::read_to_string(&path) {
-            Ok(text) => toml::from_str(&text).with_context(|| format!("invalid config {}", path.display())),
+            Ok(text) => {
+                let mut cfg: Self = toml::from_str(&text).with_context(|| format!("invalid config {}", path.display()))?;
+                cfg.threads = cfg.threads.clamp(1, 64);
+                cfg.qwen.threads = cfg.qwen.threads.clamp(0, 64);
+                cfg.validate().with_context(|| format!("invalid config {}", path.display()))?;
+                Ok(cfg)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let cfg = Self::default();
                 cfg.save()?;
@@ -142,10 +199,11 @@ impl Config {
     }
 
     pub fn save(&self) -> Result<()> {
-        std::fs::create_dir_all(Self::dir())?;
-        let tmp = Self::path().with_extension("toml.tmp");
+        let path = Self::path();
+        std::fs::create_dir_all(path.parent().unwrap_or(std::path::Path::new(".")))?;
+        let tmp = path.with_extension("toml.tmp");
         std::fs::write(&tmp, toml::to_string_pretty(self)?)?;
-        std::fs::rename(&tmp, Self::path())?;
+        std::fs::rename(&tmp, path)?;
         Ok(())
     }
 
@@ -173,6 +231,27 @@ mod tests {
         assert_eq!(cfg.rewrite.engine, "claude");
         assert_eq!(cfg.rewrite.timeout_secs, 60);
         assert!(!cfg.phrases.is_empty());
+    }
+
+    #[test]
+    fn validation_names_the_bad_setting() {
+        let mut cfg = Config::default();
+        assert!(cfg.validate().is_ok());
+        cfg.language = "de".into();
+        assert!(cfg.validate().unwrap_err().to_string().contains("language"));
+        cfg.language = "cs".into();
+        cfg.rewrite.engine = "gpt".into();
+        assert!(cfg.validate().unwrap_err().to_string().contains("rewrite.engine"));
+    }
+
+    #[test]
+    fn models_path_expands_home_and_default() {
+        let mut cfg = Config::default();
+        assert!(cfg.models_path().ends_with("dictee/models"));
+        cfg.models_dir = "/mnt/data/models".into();
+        assert_eq!(cfg.models_path(), PathBuf::from("/mnt/data/models"));
+        cfg.models_dir = "~/m".into();
+        assert!(!cfg.models_path().starts_with("~") && cfg.models_path().ends_with("m"));
     }
 
     #[test]

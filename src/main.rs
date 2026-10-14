@@ -6,26 +6,45 @@ mod deliver;
 mod download;
 mod ipc;
 mod models;
+mod options;
 mod qwen;
 mod rewrite;
 mod rewrite_api;
 mod shortcut;
 mod stt;
 mod ui;
+mod util;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use config::Config;
 use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "dictee", version, about = "Local speech-to-text dictation for Linux (Wayland friendly)")]
 struct Cli {
     #[command(subcommand)]
-    command: Option<Cmd>,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
-enum Cmd {
+enum Command {
+    /// Run the dictation daemon (default when no command is given)
+    Daemon,
+    /// Open the settings window (starts the daemon if needed)
+    Settings,
+    /// Start dictation
+    Start,
+    /// Stop dictation and deliver the text
+    Stop,
+    /// Start dictation, or stop it when it is running
+    Toggle,
+    /// Cancel dictation without text
+    Cancel,
+    /// Print the daemon state (idle, recording, transcribing, rewriting)
+    Status,
+    /// Stop the daemon
+    Quit,
     /// Transcribe a WAV file and print the text (no daemon, no clipboard)
     Transcribe {
         file: PathBuf,
@@ -33,18 +52,6 @@ enum Cmd {
         #[arg(long)]
         rewrite: bool,
     },
-    /// Run the dictation daemon (default when no command is given)
-    Daemon,
-    /// Open the settings window (starts the daemon if needed)
-    Settings,
-    /// Start / stop / toggle / cancel dictation, or print the daemon status
-    Start,
-    Stop,
-    Toggle,
-    Cancel,
-    Status,
-    /// Stop the daemon
-    Quit,
     /// List microphones
     Mics,
     /// List models, or download one with --download <id>
@@ -54,93 +61,112 @@ enum Cmd {
     },
 }
 
+impl Command {
+    /// The word the daemon understands, for the commands that are sent to it.
+    fn daemon_word(&self) -> Option<&'static str> {
+        Some(match self {
+            Command::Start => "start",
+            Command::Stop => "stop",
+            Command::Toggle => "toggle",
+            Command::Cancel => "cancel",
+            Command::Status => "status",
+            Command::Quit => "quit",
+            _ => return None,
+        })
+    }
+}
+
 fn main() -> Result<()> {
-    let cli = Cli::parse();
-    match cli.command {
-        Some(Cmd::Transcribe { file, rewrite }) => {
-            let mut cfg = config::Config::load()?;
-            if !rewrite {
-                cfg.rewrite.engine = "none".into();
+    match Cli::parse().command {
+        None | Some(Command::Daemon) => daemon(false),
+        Some(Command::Settings) => {
+            if ipc::daemon_running() {
+                ipc::send("settings")?;
+                Ok(())
+            } else {
+                daemon(true)
             }
-            let samples = audio::read_wav(&file)?;
-            let mut stt = stt::Stt::default();
-            let out = controller::process(&cfg, &mut stt, &samples, |_| {})?;
-            if let Some(e) = &out.rewrite_error {
-                eprintln!("rewrite failed: {e}");
-            }
-            if rewrite {
-                eprintln!("raw: {}", out.raw);
-            }
-            println!("{}", out.text);
         }
-        Some(Cmd::Mics) => {
+        Some(Command::Transcribe { file, rewrite }) => transcribe(&file, rewrite),
+        Some(Command::Mics) => {
             for m in audio::list_mics()? {
                 println!("{}\t{}", m.node_name, m.description);
             }
+            Ok(())
         }
-        Some(Cmd::Models { download }) => {
-            if let Some(id) = download {
-                let mut last = 0;
-                let mut report = |d: u64, t: u64| {
-                    let pct = if t > 0 { d * 100 / t } else { 0 };
-                    if pct != last {
-                        last = pct;
-                        eprint!("\r{pct}%");
-                    }
-                };
-                if qwen::find(&id).is_ok() {
-                    let mut q = config::Config::load()?.qwen;
-                    q.model = id;
-                    qwen::download_all(&q, &mut report)?;
-                } else {
-                    models::download(&id, &mut report)?;
-                }
-                eprintln!("\ndone");
-            }
-            println!("Whisper (stt_engine = \"whisper\"):");
-            for m in models::MODELS {
-                println!("  {}\t{}\t{} MB\t{}", m.id, if models::is_downloaded(m.id) { "downloaded" } else { "-" }, m.size_mb, m.label);
-            }
-            println!("Qwen3-ASR on llama.cpp (stt_engine = \"qwen\"):");
-            for m in qwen::MODELS {
-                println!("  {}\t{}\t{} MB\t{}", m.id, if qwen::model_ready(m.id) { "downloaded" } else { "-" }, m.total_mb(), m.label);
-            }
+        Some(Command::Models { download }) => list_models(download),
+        Some(other) => {
+            println!("{}", ipc::send(other.daemon_word().expect("daemon command"))?);
+            Ok(())
         }
-        None | Some(Cmd::Daemon) => daemon(false)?,
-        Some(Cmd::Settings) => {
-            if ipc::daemon_running() {
-                ipc::send("settings")?;
-            } else {
-                daemon(true)?;
+    }
+}
+
+fn transcribe(file: &std::path::Path, rewrite: bool) -> Result<()> {
+    let mut cfg = Config::load()?;
+    if !rewrite {
+        cfg.rewrite.engine = "none".into();
+    }
+    let samples = audio::read_wav(file)?;
+    let out = controller::process(&cfg, &mut stt::Stt::default(), &samples, |_| {})?;
+    if let Some(e) = &out.rewrite_error {
+        eprintln!("rewrite failed: {e}");
+    }
+    if rewrite {
+        eprintln!("raw: {}", out.raw);
+    }
+    println!("{}", out.text);
+    Ok(())
+}
+
+fn list_models(download: Option<String>) -> Result<()> {
+    let cfg = Config::load()?;
+    let root = cfg.models_path();
+    if let Some(id) = download {
+        let mut last = 0;
+        let mut report = |done: u64, total: u64| {
+            let pct = (done * 100).checked_div(total).unwrap_or(0);
+            if pct != last {
+                last = pct;
+                eprint!("\r{pct}%");
             }
+        };
+        if qwen::find(&id).is_ok() {
+            let mut q = cfg.qwen.clone();
+            q.model = id;
+            qwen::download_all(&root, &q, &mut report)?;
+        } else {
+            models::download(&root, &id, &mut report)?;
         }
-        Some(c) => {
-            let word = match c {
-                Cmd::Start => "start",
-                Cmd::Stop => "stop",
-                Cmd::Toggle => "toggle",
-                Cmd::Cancel => "cancel",
-                Cmd::Status => "status",
-                _ => "quit",
-            };
-            println!("{}", ipc::send(word)?);
-        }
+        eprintln!("\ndone");
+    }
+    let state = |ready| if ready { "downloaded" } else { "-" };
+    println!("Models folder: {}", root.display());
+    println!("Whisper (stt_engine = \"whisper\"):");
+    for m in models::MODELS {
+        println!("  {}\t{}\t{} MB\t{}", m.id, state(models::is_downloaded(&root, m.id)), m.size_mb(), m.label);
+    }
+    println!("Qwen3-ASR on llama.cpp (stt_engine = \"qwen\"):");
+    for m in qwen::MODELS {
+        println!("  {}\t{}\t{} MB\t{}", m.id, state(qwen::model_ready(&root, m.id)), m.total_mb(), m.label);
     }
     Ok(())
 }
 
 fn daemon(show_settings: bool) -> Result<()> {
-    use std::sync::{mpsc, Arc, Mutex};
-    config::Config::load()?; // fail early (and write defaults) on first start
+    use std::sync::{Arc, Mutex, mpsc};
+    Config::load()?; // fail early (and write defaults) on first start
     let (cmd_tx, cmd_rx) = mpsc::channel();
-    let (ev_tx, ev_rx) = mpsc::channel();
+    let (event_tx, event_rx) = async_channel::unbounded();
     let state = Arc::new(Mutex::new(controller::State::Idle));
     ipc::serve(cmd_tx.clone(), state.clone())?;
     let status: shortcut::Status = Arc::new(Mutex::new("Shortcut: registering...".into()));
-    shortcut::spawn(cmd_tx.clone(), status.clone());
-    let s2 = state.clone();
-    std::thread::spawn(move || controller::run(cmd_rx, ev_tx, s2));
-    ui::run(cmd_tx, ev_rx, state, status, show_settings);
+    if std::env::var_os("DICTEE_NO_PORTAL").is_none() {
+        shortcut::spawn(cmd_tx.clone(), status.clone()); // not for tests: they use their own daemon and no shortcut dialogs
+    }
+    let controller_tx = cmd_tx.clone();
+    std::thread::spawn(move || controller::Controller::new(stt::Stt::default(), event_tx, state, controller_tx).run(cmd_rx));
+    ui::run(cmd_tx, event_rx, status, show_settings);
     let _ = std::fs::remove_file(ipc::socket_path());
     Ok(())
 }

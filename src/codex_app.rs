@@ -1,8 +1,8 @@
 //! Text-only rewriting through `codex app-server` (JSONL over stdio), with all tools and features disabled.
 //! Uses the existing Codex login. The protocol follows what Mluva uses: initialize, thread/start, turn/start.
 
-use anyhow::{bail, Context, Result};
-use serde_json::{json, Value};
+use anyhow::{Context, Result, bail};
+use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -12,9 +12,29 @@ const TEXT_ONLY: &str = include_str!("../resources/codex-text-only.json");
 const BASE_INSTRUCTIONS: &str = "You transform dictated text. Follow the user's requested operation exactly. Return only replacement text, \
 without commentary, quotes, or Markdown fences. Never use tools or infer facts absent from the supplied text.";
 const ENV_ALLOWED: &[&str] = &[
-    "PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "CODEX_HOME", "OPENAI_API_KEY", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
-    "XDG_CACHE_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
-    "NO_PROXY", "https_proxy", "http_proxy", "all_proxy", "no_proxy",
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "CODEX_HOME",
+    "OPENAI_API_KEY",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_STATE_HOME",
+    "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "https_proxy",
+    "http_proxy",
+    "all_proxy",
+    "no_proxy",
 ];
 
 struct Session {
@@ -72,23 +92,24 @@ impl Session {
     }
 }
 
-fn spawn(cwd: &std::path::Path) -> Result<Session> {
-    let mut cmd = Command::new("codex");
-    // No --strict-config: older Codex versions do not know the newest feature keys and would refuse to start.
-    cmd.arg("app-server");
-    let config: serde_json::Map<String, Value> = serde_json::from_str(TEXT_ONLY)?;
+/// Makes a `codex` command text-only: every tool and feature off (`-c` overrides), a restricted environment.
+/// No --strict-config: older Codex versions do not know the newest feature keys and would refuse to start.
+pub fn make_text_only(cmd: &mut Command) {
+    let config: serde_json::Map<String, Value> = serde_json::from_str(TEXT_ONLY).expect("valid text-only config");
     for (key, value) in &config {
         cmd.arg("-c").arg(format!("{key}={value}"));
     }
     for feature in ["code_mode_only", "current_time_reminder", "send_message_to_user_async", "deferred_executor"] {
         cmd.arg("-c").arg(format!("features.{feature}=false"));
     }
-    cmd.current_dir(cwd).env_clear();
-    for var in ENV_ALLOWED {
-        if let Some(v) = std::env::var_os(var) {
-            cmd.env(var, v);
-        }
-    }
+    crate::util::restrict_env(cmd, ENV_ALLOWED);
+}
+
+fn spawn(cwd: &std::path::Path) -> Result<Session> {
+    let mut cmd = Command::new("codex");
+    cmd.arg("app-server");
+    make_text_only(&mut cmd);
+    cmd.current_dir(cwd);
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = cmd.spawn().context("cannot run 'codex app-server' (is Codex installed and logged in?)")?;
     let stdin = child.stdin.take().unwrap();
@@ -96,10 +117,10 @@ fn spawn(cwd: &std::path::Path) -> Result<Session> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(|l| l.ok()) {
-            if let Ok(v) = serde_json::from_str::<Value>(&line) {
-                if tx.send(v).is_err() {
-                    break;
-                }
+            if let Ok(v) = serde_json::from_str::<Value>(&line)
+                && tx.send(v).is_err()
+            {
+                break;
             }
         }
     });
@@ -108,11 +129,8 @@ fn spawn(cwd: &std::path::Path) -> Result<Session> {
 
 /// Runs one text transformation. `model` may be empty (Codex default model).
 pub fn run(model: &str, prompt: &str, timeout: Duration) -> Result<String> {
-    let dir = std::env::temp_dir().join(format!("dictee-codex-{}", std::process::id()));
-    std::fs::create_dir_all(&dir)?;
-    let result = run_in(&dir, model, prompt, timeout);
-    let _ = std::fs::remove_dir_all(&dir);
-    result
+    let dir = tempfile::tempdir()?; // private working directory, removed on every exit path
+    run_in(dir.path(), model, prompt, timeout)
 }
 
 fn run_in(dir: &std::path::Path, model: &str, prompt: &str, timeout: Duration) -> Result<String> {

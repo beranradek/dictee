@@ -5,9 +5,9 @@ use adw::prelude::*;
 use libadwaita as adw;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const CSS: &str = "
@@ -22,6 +22,7 @@ pub struct Bubble {
     state: Cell<State>,
     started: Cell<Option<Instant>>,
     level: RefCell<Option<Arc<AtomicU32>>>,
+    timer_running: Cell<bool>,
 }
 
 impl Bubble {
@@ -64,14 +65,10 @@ impl Bubble {
             state: Cell::new(State::Idle),
             started: Cell::new(None),
             level: RefCell::new(None),
+            timer_running: Cell::new(false),
         });
         let b = bubble.clone();
         bubble.dot.set_draw_func(move |_, cr, w, h| b.draw_dot(cr, w as f64, h as f64));
-        let b = bubble.clone();
-        gtk::glib::timeout_add_local(Duration::from_millis(60), move || {
-            b.tick();
-            gtk::glib::ControlFlow::Continue
-        });
         bubble
     }
 
@@ -79,7 +76,7 @@ impl Bubble {
         *self.level.borrow_mut() = Some(level);
     }
 
-    pub fn set_state(&self, state: State) {
+    pub fn set_state(self: &Rc<Self>, state: State) {
         self.state.set(state);
         match state {
             State::Idle => {
@@ -92,7 +89,24 @@ impl Bubble {
         }
         self.tick();
         self.window.present();
+        self.start_timer();
         self.snapshot_if_requested();
+    }
+
+    /// Redraws the timer and level while the bubble is visible; the timer stops itself when the bubble is idle.
+    fn start_timer(self: &Rc<Self>) {
+        if self.timer_running.replace(true) {
+            return;
+        }
+        let b = self.clone();
+        gtk::glib::timeout_add_local(Duration::from_millis(60), move || {
+            if b.state.get() == State::Idle {
+                b.timer_running.set(false);
+                return gtk::glib::ControlFlow::Break;
+            }
+            b.tick();
+            gtk::glib::ControlFlow::Continue
+        });
     }
 
     fn snapshot_if_requested(&self) {
@@ -111,7 +125,7 @@ impl Bubble {
             }
             State::Transcribing => "Transcribing...".to_string(),
             State::Rewriting => "Improving...".to_string(),
-            State::Idle => return self.dot.queue_draw(),
+            State::Idle => return, // hidden: nothing to update
         };
         self.label.set_text(&text);
         self.dot.queue_draw();

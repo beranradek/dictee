@@ -16,8 +16,8 @@ Press a shortcut, speak, stop. The text goes to the clipboard (optionally auto-p
   (launcher file + kglobalshortcutsrc). Any other desktop: add a custom shortcut that runs `dictee toggle`
 - Small floating bubble while dictating (see the focus note below)
 - Optional final text improvement, one of:
-  - `claude` CLI or `codex exec` CLI (your own login)
-  - **Codex app-server** (`codex app-server`, text-only, all tools disabled, your Codex login)
+  - `claude` CLI (tools disabled, your own login)
+  - `codex exec` CLI and **Codex app-server** (`codex app-server`): both run text-only, with every Codex tool and feature disabled
   - **OpenAI-compatible chat API** (LiteLLM, OpenAI, Ollama, llama.cpp ...): base URL, API key from an environment variable or a key file.
     Remote servers need https; plain http only for localhost
 - Known phrases (names of projects, repos, programs, people): given to Whisper as a prompt and to the rewrite LLM
@@ -31,7 +31,7 @@ dictee settings
 ```
 
 Build needs: Rust, cmake, a C++ compiler, libclang, GTK 4 and libadwaita dev files. Runtime needs: PipeWire (`pw-record`, `pw-dump`),
-`wl-clipboard`. Qwen3-ASR downloads its own `llama-server` (about 17 MB CPU or 30 MB Vulkan) on first use. For auto-paste also `ydotool` (running `ydotoold`, access to `/dev/uinput`).
+`wl-clipboard` (or `xclip` on X11), `notify-send` (libnotify). Qwen3-ASR downloads its own `llama-server` (about 17 MB CPU or 30 MB Vulkan) on first use. For auto-paste also `ydotool` (running `ydotoold`, access to `/dev/uinput`).
 
 1. Open **Dictee** from the app menu, choose the speech engine and download a model (Whisper Small is the default; Qwen3-ASR 1.7B Q4
    is Mluva's recommended model and about 1.6 GB).
@@ -40,6 +40,17 @@ Build needs: Rust, cmake, a C++ compiler, libclang, GTK 4 and libadwaita dev fil
 3. Dictate: press the shortcut, speak, press it again. The text is on the clipboard: Ctrl+V.
 
 Config: `~/.config/dictee/config.toml`. Models: `~/.local/share/dictee/models` (change the folder in settings).
+
+## How it behaves
+
+- While a dictation is being transcribed (bubble visible), shortcut presses and `dictee toggle|start|stop|cancel` are ignored. Wait until
+  the bubble is gone. This avoids ghost recordings.
+- Recordings shorter than 0.4 s, and recordings with no signal at all (dead or muted microphone), are not sent to the models.
+- A recording stops by itself after 15 minutes.
+- Model downloads are pinned to a fixed commit and SHA-256, have timeouts, and resume after a failure.
+- Errors (missing model, microphone not connected, invalid `config.toml`) show as a desktop notification and in the daemon log.
+- Privacy: with a rewrite engine on, the transcript and your phrase list go to that engine (the CLI's service or your API server).
+  The default phrases are generic tech terms; add your own names in Settings.
 
 ## Commands
 
@@ -66,11 +77,29 @@ dictee mics
 - Tested only on Ubuntu 26.04 / GNOME 50. **Not tested: KDE, Fedora, Sway, Hyprland.** The KDE keybinding writer follows the documented
   `kglobalshortcutsrc` method, but no Plasma session was available. Please report problems.
 
+## Architecture
+
+| Module | Job |
+| --- | --- |
+| `config`, `options` | TOML config with validation; fixed choices (engines, languages, devices) shared by UI and engines |
+| `audio` | `pw-record` capture with level and length limit, microphone list, WAV reading |
+| `stt` | `Transcribe` trait; Whisper in process; Qwen via `qwen`; silence and annotation filtering |
+| `qwen` | model catalog, runtime download, `llama-server` lifecycle (warm-up, lease, keep-alive), requests |
+| `models`, `download` | Whisper catalog; verified resumable downloads |
+| `rewrite`, `rewrite_api`, `codex_app` | final text improvement engines |
+| `controller` | state machine: record, transcribe, rewrite, deliver; `Output` trait for testable side effects |
+| `deliver` | clipboard, optional `ydotool` paste, notifications |
+| `shortcut`, `ipc` | portal shortcut with retry, GNOME/KDE keybinding writers; unix socket for `dictee toggle` |
+| `ui` | libadwaita application, bubble, settings window (form, debounced autosave, downloads) |
+
+Developer environment variables: `DICTEE_CONFIG` (config file), `DICTEE_SOCKET` (daemon socket), `DICTEE_NO_PORTAL=1` (no portal shortcut),
+`DICTEE_DEBUG=1` (more logs), `DICTEE_SNAPSHOT_SETTINGS=file.png` / `DICTEE_SNAPSHOT_BUBBLE=dir` (render windows to PNG).
+
 ## Tests
 
 ```sh
-cargo test                # unit tests
-tests/e2e.sh              # needs the daemon running and a downloaded model; plays espeak-ng speech through a virtual microphone
+cargo test                # unit tests (config, controller flow, downloads with resume, IPC, URL rules, keybinding quoting ...)
+tests/e2e.sh              # own daemon and config; plays espeak-ng speech through a virtual microphone; overwrites the clipboard
 ```
 
 `tests/audio/*.wav` were made with `espeak-ng` (English and Czech). The robotic voice gives imperfect raw text, so the tests check key words.

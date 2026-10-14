@@ -1,6 +1,6 @@
 //! Microphone capture through `pw-record` (PipeWire) and WAV loading.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -10,7 +10,7 @@ use std::thread::JoinHandle;
 
 pub const SAMPLE_RATE: u32 = 16_000;
 /// Safety cap so a forgotten recording cannot eat all memory.
-const MAX_SECONDS: usize = 15 * 60;
+pub const MAX_SECONDS: usize = 15 * 60;
 
 #[derive(Clone, Debug)]
 pub struct Mic {
@@ -32,11 +32,11 @@ fn parse_pw_dump(json: &str) -> Result<Vec<Mic>> {
     let mut mics = Vec::new();
     for obj in v.as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
         let props = &obj["info"]["props"];
-        if props["media.class"] == "Audio/Source" {
-            if let Some(name) = props["node.name"].as_str() {
-                let desc = props["node.description"].as_str().unwrap_or(name);
-                mics.push(Mic { node_name: name.into(), description: desc.into() });
-            }
+        if props["media.class"] == "Audio/Source"
+            && let Some(name) = props["node.name"].as_str()
+        {
+            let desc = props["node.description"].as_str().unwrap_or(name);
+            mics.push(Mic { node_name: name.into(), description: desc.into() });
         }
     }
     Ok(mics)
@@ -50,20 +50,27 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    /// Starts capturing 16 kHz mono from `mic` (empty = default source).
-    pub fn start(mic: &str) -> Result<Self> {
+    /// Starts capturing 16 kHz mono from `mic` (empty = default source). Fails when `pw-record` dies right away.
+    /// `on_limit` runs once when the recording reaches `MAX_SECONDS` (audio after that point is not kept).
+    pub fn start(mic: &str, on_limit: impl FnOnce() + Send + 'static) -> Result<Self> {
+        // pw-record waits forever for a target that does not exist, so check that the microphone is connected.
+        if !mic.is_empty() && list_mics().is_ok_and(|mics| !mics.iter().any(|m| m.node_name == mic)) {
+            bail!("microphone '{mic}' is not connected - choose another one in Settings");
+        }
         let mut cmd = Command::new("pw-record");
         cmd.args(["--rate", "16000", "--channels", "1", "--format", "s16"]);
         if !mic.is_empty() {
             cmd.args(["--target", mic]);
         }
-        cmd.arg("-").stdout(Stdio::piped()).stderr(Stdio::null()).stdin(Stdio::null());
+        cmd.arg("-").stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
         let mut child = cmd.spawn().context("cannot run pw-record (is pipewire-bin installed?)")?;
         let mut stdout = child.stdout.take().context("no pw-record stdout")?;
+        let mut stderr = child.stderr.take().context("no pw-record stderr")?;
         let samples = Arc::new(Mutex::new(Vec::new()));
         let level = Arc::new(AtomicU32::new(0));
         let (s2, l2) = (samples.clone(), level.clone());
         let reader = std::thread::spawn(move || {
+            let mut on_limit = Some(on_limit);
             let mut buf = [0u8; 4096];
             let mut odd: Option<u8> = None;
             while let Ok(n) = stdout.read(&mut buf) {
@@ -86,8 +93,26 @@ impl Recorder {
                 let mut all = s2.lock().unwrap();
                 if all.len() < MAX_SECONDS * SAMPLE_RATE as usize {
                     all.extend_from_slice(&chunk);
+                } else if let Some(f) = on_limit.take() {
+                    drop(all);
+                    f();
                 }
             }
+        });
+        // A bad target or a stopped PipeWire makes pw-record exit at once: report that now, not after the user has spoken.
+        for _ in 0..8 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            if let Ok(Some(status)) = child.try_wait() {
+                let mut why = String::new();
+                let _ = stderr.read_to_string(&mut why);
+                let _ = reader.join();
+                let target = if mic.is_empty() { "the default microphone".to_string() } else { format!("microphone '{mic}'") };
+                bail!("pw-record exited ({status}) - is {target} available? {}", why.trim());
+            }
+        }
+        std::thread::spawn(move || {
+            let mut sink = Vec::new();
+            let _ = stderr.read_to_end(&mut sink); // drain so pw-record can never block on a full pipe
         });
         Ok(Self { child, reader, samples, level })
     }
@@ -97,11 +122,18 @@ impl Recorder {
         self.level.clone()
     }
 
-    /// Stops capture and returns the audio as f32 in -1..1.
+    /// Stops capture and returns the audio as f32 in -1..1 (empty when nothing was captured).
     pub fn stop(mut self) -> Vec<f32> {
-        // SIGINT lets pw-record flush; kill() is the fallback.
-        let pid = self.child.id().to_string();
-        let _ = Command::new("kill").args(["-INT", &pid]).status();
+        // SIGTERM lets pw-record finish cleanly (SIGINT is ignored by processes started as background jobs);
+        // after a grace period it is killed. The audio was read from its pipe all along, so nothing is lost.
+        unsafe {
+            libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while matches!(self.child.try_wait(), Ok(None)) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = self.reader.join();
         let s = self.samples.lock().unwrap();

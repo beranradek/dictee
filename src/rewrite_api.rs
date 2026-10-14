@@ -1,46 +1,52 @@
 //! Rewriting through an OpenAI-compatible chat API (OpenAI, LiteLLM, llama.cpp server, Ollama, ...).
 
 use crate::config::RewriteCfg;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::time::Duration;
+
+/// Host part of a URL (without port, brackets of IPv6 removed).
+fn host(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let authority = rest.split('/').next().unwrap_or("");
+    match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => authority.split(':').next().unwrap_or(""),
+    }
+}
+
+/// True for `localhost` and loopback IP addresses only (not for names that merely start with 127.).
+fn is_loopback(url: &str) -> bool {
+    let h = host(url);
+    h == "localhost" || h.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
 
 /// Accepts https URLs, and http only for loopback hosts. No credentials, query or fragment in the URL.
 pub fn validate_base_url(url: &str) -> Result<()> {
-    let (secure, rest) = if let Some(r) = url.strip_prefix("https://") {
-        (true, r)
-    } else if let Some(r) = url.strip_prefix("http://") {
-        (false, r)
-    } else {
-        bail!("API base URL must start with https:// (or http:// for localhost)");
+    let rest = match (url.strip_prefix("https://"), url.strip_prefix("http://")) {
+        (Some(r), _) => r,
+        (None, Some(r)) => {
+            if !is_loopback(url) {
+                bail!("plain http is only allowed for localhost - use https:// for remote servers");
+            }
+            r
+        }
+        _ => bail!("API base URL must start with https:// (or http:// for localhost)"),
     };
     let authority = rest.split('/').next().unwrap_or("");
     if authority.is_empty() || authority.contains('@') || url.contains('?') || url.contains('#') {
         bail!("API base URL must not contain credentials, query or fragment");
     }
-    if !secure {
-        let host = if let Some(v6) = authority.strip_prefix('[') { v6.split(']').next().unwrap_or("") } else { authority.split(':').next().unwrap_or("") };
-        if !(host == "localhost" || host == "::1" || host.starts_with("127.")) {
-            bail!("plain http is only allowed for localhost - use https:// for remote servers");
-        }
-    }
     Ok(())
-}
-
-fn is_loopback(url: &str) -> bool {
-    let rest = url.trim_start_matches("https://").trim_start_matches("http://");
-    let host = rest.split('/').next().unwrap_or("");
-    host.starts_with("localhost") || host.starts_with("127.") || host.starts_with("[::1]")
 }
 
 /// The API key from the named environment variable, else from the key file; `None` when neither is configured.
 pub fn api_key(rw: &RewriteCfg) -> Result<Option<String>> {
     let env = rw.api_key_env.trim();
-    if !env.is_empty() {
-        if let Ok(v) = std::env::var(env) {
-            if !v.trim().is_empty() {
-                return Ok(Some(v.trim().to_string()));
-            }
-        }
+    if !env.is_empty()
+        && let Ok(v) = std::env::var(env)
+        && !v.trim().is_empty()
+    {
+        return Ok(Some(v.trim().to_string()));
     }
     let file = rw.api_key_file.trim();
     if !file.is_empty() {
@@ -60,11 +66,7 @@ pub fn chat(rw: &RewriteCfg, system: &str, user: &str) -> Result<String> {
     if key.is_none() && !is_loopback(base) {
         bail!("no API key: set the environment variable '{}' or an API key file", rw.api_key_env);
     }
-    let mut builder = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(rw.timeout_secs.max(5)))).http_status_as_error(true);
-    if is_loopback(base) {
-        builder = builder.proxy(None);
-    }
-    let agent: ureq::Agent = builder.build().into();
+    let agent = crate::util::http_agent(Duration::from_secs(rw.timeout_secs.max(5)), !is_loopback(base));
     let mut req = agent.post(&format!("{base}/chat/completions"));
     if let Some(k) = key {
         req = req.header("Authorization", &format!("Bearer {k}"));
@@ -98,6 +100,9 @@ mod tests {
         assert!(validate_base_url("http://127.0.0.1:8080/v1").is_ok());
         assert!(validate_base_url("http://[::1]:8080/v1").is_ok());
         assert!(validate_base_url("http://example.com/v1").is_err());
+        assert!(validate_base_url("http://127.0.0.1.evil.com/v1").is_err());
+        assert!(validate_base_url("http://localhost.evil.com/v1").is_err());
+        assert!(validate_base_url("https:///v1").is_err());
         assert!(validate_base_url("https://user:pw@example.com/v1").is_err());
         assert!(validate_base_url("https://example.com/v1?key=1").is_err());
         assert!(validate_base_url("ftp://example.com").is_err());
@@ -116,7 +121,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("key");
         std::fs::write(&f, "sk-test\n").unwrap();
-        let rw = RewriteCfg { api_key_env: "DICTEE_TEST_NO_SUCH_VAR".into(), api_key_file: f.display().to_string(), ..RewriteCfg::default() };
+        let rw =
+            RewriteCfg { api_key_env: "DICTEE_TEST_NO_SUCH_VAR".into(), api_key_file: f.display().to_string(), ..RewriteCfg::default() };
         assert_eq!(api_key(&rw).unwrap().as_deref(), Some("sk-test"));
         let none = RewriteCfg { api_key_env: String::new(), api_key_file: String::new(), ..RewriteCfg::default() };
         assert_eq!(api_key(&none).unwrap(), None);

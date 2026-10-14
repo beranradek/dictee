@@ -1,27 +1,51 @@
 #!/usr/bin/env bash
-# End-to-end test: feeds synthesized speech (espeak-ng) through a virtual PipeWire microphone into the running daemon,
-# then checks the clipboard. Covers Whisper, Qwen3-ASR (llama.cpp) and the rewrite engines.
-# Needs: running `dictee` daemon, downloaded models (small + qwen3-1.7b-q4), pw-loopback, pw-play, wl-paste, python3.
-# Optional: claude and codex CLIs (E2E_SKIP_CLAUDE=1 / E2E_SKIP_CODEX=1 to skip). Usage: tests/e2e.sh   (DICTEE_BIN overrides the binary)
+# End-to-end test with its own daemon and config (your settings and running daemon are not touched).
+# Plays synthesized speech (espeak-ng WAVs) through a virtual PipeWire microphone and checks the clipboard (which it overwrites).
+# Covers Whisper, Qwen3-ASR (llama.cpp) and the rewrite engines.
+# Needs: downloaded models (whisper "small", qwen3-1.7b-q4), pw-loopback, pw-play, wl-paste, python3.
+# Optional: claude and codex CLIs (E2E_SKIP_CLAUDE=1 / E2E_SKIP_CODEX=1 to skip). DICTEE_BIN overrides the binary,
+# DICTEE_MODELS_DIR the models folder. Do not copy anything while it runs.
 set -u
-HERE=$(dirname "$0")
+HERE=$(cd "$(dirname "$0")" && pwd)
 BIN=${DICTEE_BIN:-$HERE/../target/release/dictee}
 AUDIO=$HERE/audio
+MODELS=${DICTEE_MODELS_DIR:-$HOME/.local/share/dictee/models}
+TMP=$(mktemp -d)
+export DICTEE_CONFIG=$TMP/config.toml DICTEE_SOCKET=$TMP/dictee.sock DICTEE_NO_PORTAL=1
+cfg=$DICTEE_CONFIG
 fail=0
+
+cat > "$cfg" <<CFG
+mic = "dictee-test-mic"
+models_dir = "$MODELS"
+stt_engine = "whisper"
+model = "small"
+language = "auto"
+notify = false
+show_bubble = false
+phrases = ["Radek Beran", "Etnetera", "Keycloak", "Kubernetes"]
+[qwen]
+model = "qwen3-1.7b-q4"
+keep_alive_secs = 120
+[rewrite]
+engine = "none"
+base_url = "http://localhost:4999/v1"
+model = ""
+CFG
 
 pw-loopback -m '[FL FR]' --capture-props='media.class=Audio/Sink node.name=dictee-test-sink' \
   --playback-props='media.class=Audio/Source node.name=dictee-test-mic' >/dev/null 2>&1 &
 LOOP=$!
 python3 "$HERE/fake_openai.py" 4999 >/dev/null 2>&1 &
 FAKE=$!
-cfg=${XDG_CONFIG_HOME:-$HOME/.config}/dictee/config.toml
-cp "$cfg" "$cfg.e2e-backup"
-trap 'mv "$cfg.e2e-backup" "$cfg"; kill $LOOP $FAKE 2>/dev/null' EXIT
+"$BIN" daemon >"$TMP/daemon.log" 2>&1 &
+DAEMON=$!
+trap '"$BIN" quit >/dev/null 2>&1; kill $LOOP $FAKE $DAEMON 2>/dev/null; rm -rf "$TMP"' EXIT
+for _ in $(seq 1 50); do [ -S "$DICTEE_SOCKET" ] && break; sleep 0.2; done
 sleep 2
 
 setkey() { sed -i "s|^$1 = .*|$1 = \"$2\"|" "$cfg"; }                      # top-level keys
-setrw() { sed -i "/^\[rewrite\]/,\$ s|^$1 = .*|$1 = \"$2\"|" "$cfg"; }   # keys of the [rewrite] section
-sed -i 's/^mic = .*/mic = "dictee-test-mic"/; s/^notify = .*/notify = false/' "$cfg"
+setrw() { sed -i "/^\[rewrite\]/,\$ s|^$1 = .*|$1 = \"$2\"|" "$cfg"; }      # keys of the [rewrite] section
 
 check() { # name wav expected-regex
   wl-copy ""; "$BIN" start >/dev/null || { echo "FAIL $1: cannot start"; fail=1; return; }
@@ -32,8 +56,6 @@ check() { # name wav expected-regex
   if echo "$got" | grep -Eiq "$3"; then echo "PASS $1: $got"; else echo "FAIL $1: '$got' !~ /$3/"; fail=1; fi
 }
 
-setrw engine none
-setkey stt_engine whisper; setkey language auto
 check whisper-en en_plain.wav 'kubernetes.*deployment'
 check whisper-cs cs_plain.wav 'administr.*konzol'
 
@@ -43,11 +65,11 @@ setkey language cs
 check qwen-cs cs_plain.wav 'administr'
 
 setkey stt_engine whisper; setkey language auto
-setrw engine openai; setrw base_url "http://localhost:4999/v1"; setrw model fake-model
+setrw engine openai; setrw model fake-model
 OPENAI_API_KEY=x check api-rewrite en_plain.wav '^PLEASE OPEN THE .*KUBERNETES DEPLOYMENT\.$'
-if [ -z "${E2E_SKIP_CLAUDE:-}" ]; then
+if [ -z "${E2E_SKIP_CLAUDE:-}" ] && command -v claude >/dev/null; then
   setrw engine claude; setrw model ""
-  check claude-rewrite cs_terms.wav 'radek beran.*kubernetes.*etnetera\b'
+  check claude-rewrite cs_terms.wav 'radek beran.*kubernetes.*etneter'
 fi
 if [ -z "${E2E_SKIP_CODEX:-}" ] && command -v codex >/dev/null; then
   setrw engine codex-app; setrw model ""

@@ -4,8 +4,9 @@
 //! listens only on 127.0.0.1 with a random API key, and dies together with the daemon.
 
 use crate::config::{Config, QwenCfg};
-use crate::{audio::SAMPLE_RATE, download, models};
-use anyhow::{bail, Context, Result};
+use crate::download::{self, RemoteFile};
+use crate::{audio, options, util};
+use anyhow::{Context, Result, bail};
 use base64::Engine;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
@@ -18,58 +19,104 @@ use std::time::{Duration, Instant};
 pub const RUNTIME_VERSION: &str = "b11011";
 /// Longest audio piece sent in one request (keeps the 4096 token context safe).
 const MAX_CHUNK_SECONDS: usize = 30;
-const LANGUAGE_NAMES: [(&str, &str); 2] = [("cs", "Czech"), ("en", "English")];
+/// A warm server is kept at least this long while the user records (the recording cap plus a margin).
+const WARM_MAX: Duration = Duration::from_secs(audio::MAX_SECONDS as u64 + 5 * 60);
+const SERVER_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LANG",
+    "LC_ALL",
+    "XDG_RUNTIME_DIR",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "VK_ICD_FILENAMES",
+    "VK_DRIVER_FILES",
+    "LD_LIBRARY_PATH",
+];
 
 pub struct QwenModel {
     pub id: &'static str,
     pub label: &'static str,
-    pub repo: &'static str,
-    pub revision: &'static str,
-    pub model_file: &'static str,
-    pub model_size: u64,
-    pub mmproj_file: &'static str,
-    pub mmproj_size: u64,
+    pub model: RemoteFile,
+    pub mmproj: RemoteFile,
     pub ram_gb: f32,
 }
 
 impl QwenModel {
     pub fn total_mb(&self) -> u64 {
-        (self.model_size + self.mmproj_size) / 1_000_000
+        (self.model.size + self.mmproj.size) / 1_000_000
     }
 }
+
+const fn file(repo: &'static str, revision: &'static str, name: &'static str, size: u64, sha256: &'static str) -> RemoteFile {
+    RemoteFile { repo, revision, name, size, sha256 }
+}
+
+const REV_0_6B: &str = "928ab958557df9aa2ef1c93e0e83c7ad0933fae2";
+const REV_1_7B_Q8: &str = "36a678687ba7d07a74ca70ccb0e36902e005fb80";
+const REV_1_7B_Q4: &str = "bdff9f9b31f387d6eb797a8d827c08904048c57c";
+const REPO_1_7B_Q4: &str = "getonit/Qwen3-ASR-1.7B-Q4_0-GGUF";
 
 pub const MODELS: &[QwenModel] = &[
     QwenModel {
         id: "qwen3-0.6b-q8",
         label: "0.6B Q8 - small, fast",
-        repo: "ggml-org/Qwen3-ASR-0.6B-GGUF",
-        revision: "main",
-        model_file: "Qwen3-ASR-0.6B-Q8_0.gguf",
-        model_size: 804_749_248,
-        mmproj_file: "mmproj-Qwen3-ASR-0.6B-Q8_0.gguf",
-        mmproj_size: 214_392_480,
+        model: file(
+            "ggml-org/Qwen3-ASR-0.6B-GGUF",
+            REV_0_6B,
+            "Qwen3-ASR-0.6B-Q8_0.gguf",
+            804_749_248,
+            "bca259818b50ca7c4c05e9bdb35a5dc04fa039653a6d6f3f0f331f96f6aa1971",
+        ),
+        mmproj: file(
+            "ggml-org/Qwen3-ASR-0.6B-GGUF",
+            REV_0_6B,
+            "mmproj-Qwen3-ASR-0.6B-Q8_0.gguf",
+            214_392_480,
+            "41a342b5e4c514e968cb756de6cd1b7be39eff43c44c57a2ef5fc6522e36603d",
+        ),
         ram_gb: 2.0,
     },
     QwenModel {
         id: "qwen3-1.7b-q4",
         label: "1.7B Q4 - recommended",
-        repo: "getonit/Qwen3-ASR-1.7B-Q4_0-GGUF",
-        revision: "bdff9f9b31f387d6eb797a8d827c08904048c57c",
-        model_file: "Qwen3-ASR-1.7B-Q4_0.gguf",
-        model_size: 1_229_449_152,
-        mmproj_file: "mmproj-Qwen3-ASR-1.7B-Q8_0.gguf",
-        mmproj_size: 355_709_344,
+        model: file(
+            REPO_1_7B_Q4,
+            REV_1_7B_Q4,
+            "Qwen3-ASR-1.7B-Q4_0.gguf",
+            1_229_449_152,
+            "adf2c487fcce3993bb30c9406748f5ef111a3a28b0a6c26f34223185011427c7",
+        ),
+        mmproj: file(
+            REPO_1_7B_Q4,
+            REV_1_7B_Q4,
+            "mmproj-Qwen3-ASR-1.7B-Q8_0.gguf",
+            355_709_344,
+            "46c1d533af3f354ceb37ce855dbceff7da7fa7cf1e6a523df3b13440bd164c0d",
+        ),
         ram_gb: 3.5,
     },
     QwenModel {
         id: "qwen3-1.7b-q8",
         label: "1.7B Q8 - best quality",
-        repo: "ggml-org/Qwen3-ASR-1.7B-GGUF",
-        revision: "main",
-        model_file: "Qwen3-ASR-1.7B-Q8_0.gguf",
-        model_size: 2_165_034_944,
-        mmproj_file: "mmproj-Qwen3-ASR-1.7B-Q8_0.gguf",
-        mmproj_size: 355_709_344,
+        model: file(
+            "ggml-org/Qwen3-ASR-1.7B-GGUF",
+            REV_1_7B_Q8,
+            "Qwen3-ASR-1.7B-Q8_0.gguf",
+            2_165_034_944,
+            "58e22d0532d4eacaf034cfac17a6fed159f37c41390c710186783be439d1fc57",
+        ),
+        mmproj: file(
+            "ggml-org/Qwen3-ASR-1.7B-GGUF",
+            REV_1_7B_Q8,
+            "mmproj-Qwen3-ASR-1.7B-Q8_0.gguf",
+            355_709_344,
+            "46c1d533af3f354ceb37ce855dbceff7da7fa7cf1e6a523df3b13440bd164c0d",
+        ),
         ram_gb: 4.5,
     },
 ];
@@ -100,89 +147,87 @@ pub fn find(id: &str) -> Result<&'static QwenModel> {
     MODELS.iter().find(|m| m.id == id).with_context(|| format!("unknown Qwen model '{id}'"))
 }
 
-fn root() -> PathBuf {
-    models::dir().join("qwen")
+// Paths. `root` is the configured models folder (`Config::models_path`).
+
+pub fn model_dir(root: &Path, id: &str) -> PathBuf {
+    root.join("qwen").join(id)
 }
 
-pub fn model_dir(id: &str) -> PathBuf {
-    root().join(id)
+fn runtime_dir(root: &Path, device: &str) -> PathBuf {
+    root.join("qwen").join("runtime").join(format!("{device}-{RUNTIME_VERSION}"))
 }
 
-fn runtime_dir(device: &str) -> PathBuf {
-    root().join("runtime").join(format!("{device}-{RUNTIME_VERSION}"))
-}
-
-/// The managed `llama-server` binary for a device (the tarball has one top folder, `llama-<version>`).
-fn managed_binary(device: &str) -> PathBuf {
-    runtime_dir(device).join(format!("llama-{RUNTIME_VERSION}")).join("llama-server")
+/// The managed `llama-server` binary (the tarball has one top folder, `llama-<version>`).
+fn managed_binary(root: &Path, device: &str) -> PathBuf {
+    runtime_dir(root, device).join(format!("llama-{RUNTIME_VERSION}")).join("llama-server")
 }
 
 /// The server to run: the user's own binary, or the managed download.
-pub fn server_binary(cfg: &QwenCfg) -> Result<PathBuf> {
-    let path = if cfg.server_path.trim().is_empty() { managed_binary(&cfg.device) } else { PathBuf::from(cfg.server_path.trim()) };
+pub fn server_binary(root: &Path, cfg: &QwenCfg) -> Result<PathBuf> {
+    let own = cfg.server_path.trim();
+    let path = if own.is_empty() { managed_binary(root, &cfg.device) } else { PathBuf::from(own) };
     if !path.is_file() {
         bail!("llama-server not found at {} - download the runtime in Settings", path.display());
     }
     Ok(path)
 }
 
-pub fn model_ready(id: &str) -> bool {
-    find(id).map(|m| model_dir(id).join(m.model_file).is_file() && model_dir(id).join(m.mmproj_file).is_file()).unwrap_or(false)
+pub fn model_ready(root: &Path, id: &str) -> bool {
+    find(id).map(|m| m.model.is_in(&model_dir(root, id)) && m.mmproj.is_in(&model_dir(root, id))).unwrap_or(false)
 }
 
-pub fn runtime_ready(cfg: &QwenCfg) -> bool {
-    server_binary(cfg).is_ok()
-}
-
-pub fn ready(cfg: &QwenCfg) -> bool {
-    model_ready(&cfg.model) && runtime_ready(cfg)
+pub fn ready(root: &Path, cfg: &QwenCfg) -> bool {
+    model_ready(root, &cfg.model) && server_binary(root, cfg).is_ok()
 }
 
 /// Downloads the runtime (unless the user set an own server path) and the model files.
 /// `progress` gets `(bytes_done, bytes_total)` over everything.
-pub fn download_all(cfg: &QwenCfg, mut progress: impl FnMut(u64, u64)) -> Result<()> {
+pub fn download_all(root: &Path, cfg: &QwenCfg, mut progress: impl FnMut(u64, u64)) -> Result<()> {
     let model = find(&cfg.model)?;
-    let own_server = !cfg.server_path.trim().is_empty();
     let asset = runtime_asset(&cfg.device)?;
-    let need_runtime = !own_server && !managed_binary(&cfg.device).is_file();
-    let dir = model_dir(model.id);
-    let files = [(model.model_file, model.model_size), (model.mmproj_file, model.mmproj_size)];
-    let mut total: u64 = if need_runtime { asset.size } else { 0 };
-    total += files.iter().filter(|(f, _)| !dir.join(f).is_file()).map(|(_, s)| s).sum::<u64>();
+    let need_runtime = cfg.server_path.trim().is_empty() && !managed_binary(root, &cfg.device).is_file();
+    let dir = model_dir(root, model.id);
+    let files: Vec<&RemoteFile> = [&model.model, &model.mmproj].into_iter().filter(|f| !f.is_in(&dir)).collect();
+    let total = if need_runtime { asset.size } else { 0 } + files.iter().map(|f| f.size).sum::<u64>();
     let mut base = 0u64;
 
     if need_runtime {
-        let archive = runtime_dir(&cfg.device).join("runtime.tar.gz");
-        download::fetch(asset.url, &archive, asset.sha256, |d, _| progress(base + d, total))?;
+        let runtime = runtime_dir(root, &cfg.device);
+        let archive = runtime.with_extension("tar.gz");
+        download::fetch(asset.url, &archive, asset.sha256, |d, _| progress(d, total))?;
         base += asset.size;
-        unpack(&archive, &runtime_dir(&cfg.device))?;
+        let unpacked = unpack(&archive, &runtime);
         let _ = std::fs::remove_file(&archive);
+        unpacked?;
     }
-    for (file, size) in files {
-        let target = dir.join(file);
-        if target.is_file() {
-            continue;
-        }
-        let expected = download::hf_sha256(model.repo, model.revision, file)?;
-        download::fetch(&download::hf_url(model.repo, model.revision, file), &target, &expected, |d, _| progress(base + d, total))?;
-        base += size;
+    for f in files {
+        f.fetch_into(&dir, |d, _| progress(base + d, total))?;
+        base += f.size;
     }
     progress(total, total);
     Ok(())
 }
 
+/// Unpacks into a staging folder and renames it, so a failed unpack never leaves a half-installed runtime.
 fn unpack(archive: &Path, dest: &Path) -> Result<()> {
-    let file = std::fs::File::open(archive)?;
-    // `tar` refuses entries that escape the destination (absolute paths, `..`).
-    tar::Archive::new(flate2::read::GzDecoder::new(file)).unpack(dest).context("cannot unpack llama.cpp runtime")?;
-    if !managed_binary_in(dest).is_file() {
-        bail!("llama-server missing in the runtime archive");
+    let stage = dest.with_extension("stage");
+    let _ = std::fs::remove_dir_all(&stage);
+    std::fs::create_dir_all(&stage)?;
+    let result = (|| {
+        let file = std::fs::File::open(archive)?;
+        // `tar` refuses entries that escape the destination (absolute paths, `..`).
+        tar::Archive::new(flate2::read::GzDecoder::new(file)).unpack(&stage).context("cannot unpack llama.cpp runtime")?;
+        if !stage.join(format!("llama-{RUNTIME_VERSION}")).join("llama-server").is_file() {
+            bail!("llama-server missing in the runtime archive");
+        }
+        let _ = std::fs::remove_dir_all(dest);
+        std::fs::rename(&stage, dest)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&stage);
     }
-    Ok(())
-}
-
-fn managed_binary_in(runtime: &Path) -> PathBuf {
-    runtime.join(format!("llama-{RUNTIME_VERSION}")).join("llama-server")
+    result
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -206,147 +251,172 @@ struct Inner {
     running: Option<Running>,
     last_used: Option<Instant>,
     keep_alive: Duration,
+    /// Number of leases (requests, or warm-ups in progress)
     busy: usize,
+    /// Set by a warm-up: the server is meant for the recording that is in progress
+    warm_since: Option<Instant>,
 }
+
+type SpawnRequest = (Command, Sender<std::io::Result<Child>>);
 
 /// Owner of the (lazily started) llama-server process.
 #[derive(Clone)]
 pub struct Server {
     inner: Arc<Mutex<Inner>>,
+    /// Serializes server starts, so `inner` is never held while the (slow) start runs.
+    start_lock: Arc<Mutex<()>>,
     /// Processes are spawned by the long-lived reaper thread: PR_SET_PDEATHSIG fires when the *thread* that spawned the child exits.
-    spawner: Sender<(Command, Sender<std::io::Result<Child>>)>,
+    spawner: Sender<SpawnRequest>,
+}
+
+/// A running server that cannot be stopped while the lease exists.
+struct Lease {
+    inner: Arc<Mutex<Inner>>,
+    port: u16,
+    key: String,
+    stop_when_unused: bool,
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let mut g = self.inner.lock().unwrap();
+        g.busy -= 1;
+        g.last_used = Some(Instant::now());
+        if self.stop_when_unused && g.busy == 0 {
+            g.running = None;
+        }
+    }
 }
 
 impl Server {
     pub fn new() -> Self {
         let inner: Arc<Mutex<Inner>> = Arc::default();
         let weak = Arc::downgrade(&inner);
-        let (spawner, requests) = mpsc::channel::<(Command, Sender<std::io::Result<Child>>)>();
-        std::thread::spawn(move || loop {
-            // Spawns children on request, and stops an idle server so the model leaves RAM.
-            match requests.recv_timeout(Duration::from_secs(2)) {
-                Ok((mut cmd, reply)) => {
-                    let _ = reply.send(cmd.spawn());
+        let (spawner, requests) = mpsc::channel::<SpawnRequest>();
+        std::thread::spawn(move || {
+            loop {
+                // Spawns children on request, and stops an idle server so the model leaves RAM.
+                match requests.recv_timeout(Duration::from_secs(2)) {
+                    Ok((mut cmd, reply)) => {
+                        let _ = reply.send(cmd.spawn());
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-            let Some(inner) = weak.upgrade() else { break };
-            let mut g = inner.lock().unwrap();
-            let idle = g.last_used.map(|t| t.elapsed() > g.keep_alive).unwrap_or(false);
-            if g.running.is_some() && g.busy == 0 && idle {
-                g.running = None;
+                let Some(inner) = weak.upgrade() else { break };
+                let mut g = inner.lock().unwrap();
+                let warm = g.warm_since.is_some_and(|t| t.elapsed() < WARM_MAX);
+                let idle = g.last_used.is_some_and(|t| t.elapsed() > g.keep_alive);
+                if g.running.is_some() && g.busy == 0 && idle && !warm {
+                    g.running = None;
+                }
             }
         });
-        Self { inner, spawner }
+        Self { inner, start_lock: Arc::default(), spawner }
     }
 
-    /// Starts (or reuses) the server. Blocks until it answers `/health`.
-    pub fn ensure(&self, cfg: &Config) -> Result<(u16, String)> {
-        let q = &cfg.qwen;
+    /// Starts (or reuses) the server and returns a lease. Blocks until the server answers `/health`.
+    fn acquire(&self, cfg: &Config, warm: bool) -> Result<Lease> {
         let sig = signature(cfg);
-        let mut g = self.inner.lock().unwrap();
-        g.keep_alive = Duration::from_secs(q.keep_alive_secs);
-        g.last_used = Some(Instant::now());
-        if let Some(r) = g.running.as_mut() {
-            if r.signature == sig && matches!(r.child.try_wait(), Ok(None)) {
-                return Ok((r.port, r.key.clone()));
+        let _one_start_at_a_time = self.start_lock.lock().unwrap();
+        {
+            let mut g = self.inner.lock().unwrap();
+            g.keep_alive = Duration::from_secs(cfg.qwen.keep_alive_secs);
+            g.last_used = Some(Instant::now());
+            g.warm_since = warm.then(Instant::now);
+            if g.running.as_mut().is_some_and(|r| r.signature == sig && matches!(r.child.try_wait(), Ok(None))) {
+                return Ok(self.lease(&mut g, warm, cfg));
             }
+            g.running = None; // stops a server that is dead or configured differently
         }
-        g.running = None;
-        let running = start(cfg, sig, &self.spawner)?;
-        let out = (running.port, running.key.clone());
+        let running = start(cfg, sig, &self.spawner)?; // slow: `inner` is not held, so cancel and stop stay responsive
+        let mut g = self.inner.lock().unwrap();
         g.running = Some(running);
-        Ok(out)
+        Ok(self.lease(&mut g, warm, cfg))
+    }
+
+    fn lease(&self, g: &mut Inner, warm: bool, cfg: &Config) -> Lease {
+        let r = g.running.as_ref().expect("server is running");
+        g.busy += 1;
+        Lease { inner: self.inner.clone(), port: r.port, key: r.key.clone(), stop_when_unused: !warm && cfg.qwen.keep_alive_secs == 0 }
     }
 
     /// Fire and forget start, used at the beginning of a recording.
     pub fn prewarm(&self, cfg: Config) {
         let me = self.clone();
         std::thread::spawn(move || {
-            if let Err(e) = me.ensure(&cfg) {
+            if let Err(e) = me.acquire(&cfg, true) {
                 eprintln!("dictee: qwen warm-up failed: {e:#}");
             }
         });
     }
 
+    /// The recording was cancelled: the warm server may now follow the normal keep-alive rule.
+    pub fn cancel_warmup(&self) {
+        self.inner.lock().unwrap().warm_since = None;
+    }
+
     pub fn transcribe(&self, cfg: &Config, samples: &[f32]) -> Result<String> {
-        let (port, key) = self.ensure(cfg)?;
-        self.inner.lock().unwrap().busy += 1;
-        let result = (|| {
-            let mut parts = Vec::new();
-            let context = crate::stt::build_prompt(&cfg.clean_phrases());
-            for chunk in split_chunks(samples, MAX_CHUNK_SECONDS) {
-                let wav = wav_bytes(chunk);
-                let mut text = recognize(port, &key, &wav, &cfg.language, &context)?;
-                if !context.is_empty() && echoes_context(&text, &context) {
-                    // The model repeated the phrase list instead of transcribing: ask again without context.
-                    text = recognize(port, &key, &wav, &cfg.language, "")?;
-                }
-                if !text.is_empty() {
-                    parts.push(text);
-                }
+        let lease = self.acquire(cfg, false)?;
+        let context = crate::stt::build_prompt(&cfg.clean_phrases());
+        let mut parts = Vec::new();
+        for chunk in split_chunks(samples, MAX_CHUNK_SECONDS) {
+            let wav = wav_bytes(chunk);
+            let mut text = recognize(&lease, &wav, &cfg.language, &context)?;
+            if !context.is_empty() && echoes_context(&text, &context) {
+                // The model repeated the phrase list instead of transcribing: ask again without context.
+                text = recognize(&lease, &wav, &cfg.language, "")?;
             }
-            Ok(parts.join(" "))
-        })();
-        let mut g = self.inner.lock().unwrap();
-        g.busy -= 1;
-        g.last_used = Some(Instant::now());
-        if cfg.qwen.keep_alive_secs == 0 && g.busy == 0 {
-            g.running = None;
+            if !text.is_empty() {
+                parts.push(text);
+            }
         }
-        result
+        Ok(parts.join(" "))
     }
 }
 
 fn signature(cfg: &Config) -> String {
     let q = &cfg.qwen;
-    let threads = if q.threads > 0 { q.threads } else { cfg.threads };
-    format!("{}|{}|{}|{}|{}", q.model, q.device, q.server_path, threads, models::dir().display())
+    format!("{}|{}|{}|{}|{}", q.model, q.device, q.server_path, threads(cfg), cfg.models_path().display())
 }
 
-fn start(cfg: &Config, signature: String, spawner: &Sender<(Command, Sender<std::io::Result<Child>>)>) -> Result<Running> {
+fn threads(cfg: &Config) -> i32 {
+    if cfg.qwen.threads > 0 { cfg.qwen.threads } else { cfg.threads }
+}
+
+fn start(cfg: &Config, signature: String, spawner: &Sender<SpawnRequest>) -> Result<Running> {
     let q = &cfg.qwen;
+    let root = cfg.models_path();
     let model = find(&q.model)?;
-    if !model_ready(&q.model) {
+    if !model_ready(&root, &q.model) {
         bail!("Qwen model '{}' is not downloaded - open Settings and download it", q.model);
     }
-    let binary = server_binary(q)?;
-    let own = !q.server_path.trim().is_empty();
-    let dir = model_dir(model.id);
+    let binary = server_binary(&root, q)?;
+    let dir = model_dir(&root, model.id);
     let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
     let key = random_key()?;
-    let key_dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join(format!("dictee-{}", std::process::id()));
-    std::fs::create_dir_all(&key_dir)?;
-    std::fs::set_permissions(&key_dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
-    let key_file = key_dir.join("key");
+    // The key file lives in a private folder and is removed as soon as the server has read it.
+    let key_base = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let key_dir = tempfile::Builder::new().prefix("dictee-").tempdir_in(key_base)?;
+    let key_file = key_dir.path().join("key");
     {
         use std::io::Write;
-        std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&key_file)?.write_all(key.as_bytes())?;
+        std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&key_file)?.write_all(key.as_bytes())?;
     }
-    let threads = (if q.threads > 0 { q.threads } else { cfg.threads }).to_string();
-    let gpu = q.device != "cpu";
     let mut cmd = Command::new(&binary);
-    cmd.arg("-m").arg(dir.join(model.model_file)).arg("--mmproj").arg(dir.join(model.mmproj_file));
+    cmd.arg("-m").arg(dir.join(model.model.name)).arg("--mmproj").arg(dir.join(model.mmproj.name));
     cmd.args(["--host", "127.0.0.1", "--port", &port.to_string(), "--api-key-file"]).arg(&key_file);
-    cmd.args(["--no-webui", "--log-disable", "-c", "4096", "-np", "1", "-t", &threads, "-tb", &threads]);
-    if !own {
+    let t = threads(cfg).to_string();
+    cmd.args(["--no-webui", "--log-disable", "-c", "4096", "-np", "1", "-t", &t, "-tb", &t]);
+    if q.server_path.trim().is_empty() {
         cmd.args(["--fit", "off"]); // flag of the pinned release; an own binary may not know it
     }
-    if gpu {
-        cmd.args(["-ngl", "99"]);
-    } else {
+    if q.device == "cpu" {
         cmd.args(["--device", "none", "-ngl", "0", "--no-mmproj-offload", "--no-op-offload"]);
+    } else {
+        cmd.args(["-ngl", "99"]);
     }
-    cmd.env_clear();
-    for var in [
-        "PATH", "HOME", "USER", "LANG", "LC_ALL", "XDG_RUNTIME_DIR", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "DISPLAY",
-        "WAYLAND_DISPLAY", "VK_ICD_FILENAMES", "VK_DRIVER_FILES", "LD_LIBRARY_PATH",
-    ] {
-        if let Some(v) = std::env::var_os(var) {
-            cmd.env(var, v);
-        }
-    }
+    util::restrict_env(&mut cmd, SERVER_ENV);
     let debug = std::env::var_os("DICTEE_DEBUG").is_some();
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(if debug { Stdio::inherit() } else { Stdio::null() });
     // Die with the daemon, even when it crashes.
@@ -359,24 +429,25 @@ fn start(cfg: &Config, signature: String, spawner: &Sender<(Command, Sender<std:
     let (reply_tx, reply_rx) = mpsc::channel();
     spawner.send((cmd, reply_tx)).map_err(|_| anyhow::anyhow!("spawner thread is gone"))?;
     let child = reply_rx.recv()?.with_context(|| format!("cannot start {}", binary.display()))?;
-    let mut running = Running { child, port, key, signature };
-    let agent = agent(Duration::from_millis(800));
-    let deadline = Instant::now() + Duration::from_secs(180);
-    let result = loop {
+    let running = Running { child, port, key, signature }; // dropping it kills the child on every error below
+    wait_healthy(running, Duration::from_secs(180))
+}
+
+fn wait_healthy(mut running: Running, limit: Duration) -> Result<Running> {
+    let agent = util::http_agent(Duration::from_millis(800), false);
+    let deadline = Instant::now() + limit;
+    loop {
         if let Ok(Some(status)) = running.child.try_wait() {
-            break Err(anyhow::anyhow!("llama-server exited at start ({status}); try the CPU device or another model"));
+            bail!("llama-server exited at start ({status}); try the CPU device or another model");
         }
         if Instant::now() > deadline {
-            break Err(anyhow::anyhow!("llama-server did not become ready in 180 s"));
+            bail!("llama-server did not become ready in {} s", limit.as_secs());
         }
-        if agent.get(&format!("http://127.0.0.1:{port}/health")).call().is_ok() {
-            break Ok(());
+        if agent.get(&format!("http://127.0.0.1:{}/health", running.port)).call().is_ok() {
+            return Ok(running);
         }
         std::thread::sleep(Duration::from_millis(200));
-    };
-    let _ = std::fs::remove_dir_all(&key_dir); // the server has read the key; do not leave it on disk
-    result?;
-    Ok(running)
+    }
 }
 
 fn random_key() -> Result<String> {
@@ -386,15 +457,11 @@ fn random_key() -> Result<String> {
     Ok(b.iter().map(|x| format!("{x:02x}")).collect())
 }
 
-fn agent(timeout: Duration) -> ureq::Agent {
-    ureq::Agent::config_builder().timeout_global(Some(timeout)).proxy(None).http_status_as_error(true).build().into()
-}
-
-fn recognize(port: u16, key: &str, wav: &[u8], language: &str, context: &str) -> Result<String> {
+fn recognize(lease: &Lease, wav: &[u8], language: &str, context: &str) -> Result<String> {
     let body = request_body(wav, language, context);
-    let resp = agent(Duration::from_secs(180))
-        .post(&format!("http://127.0.0.1:{port}/v1/chat/completions"))
-        .header("Authorization", &format!("Bearer {key}"))
+    let resp = util::http_agent(Duration::from_secs(180), false)
+        .post(&format!("http://127.0.0.1:{}/v1/chat/completions", lease.port))
+        .header("Authorization", &format!("Bearer {}", lease.key))
         .send_json(&body)
         .context("llama-server request failed")?;
     let v: serde_json::Value = resp.into_body().read_json()?;
@@ -410,7 +477,7 @@ fn request_body(wav: &[u8], language: &str, context: &str) -> serde_json::Value 
     }
     messages.push(serde_json::json!({"role":"user","content":[{"type":"input_audio","input_audio":{"data":audio,"format":"wav"}}]}));
     let mut body = serde_json::json!({"temperature":0,"max_tokens":1024,"stream":false,"cache_prompt":false});
-    if let Some((_, name)) = LANGUAGE_NAMES.iter().find(|(code, _)| *code == language) {
+    if let Some(name) = forced_language(language) {
         // Forcing the language: continue a prepared assistant answer.
         messages.push(serde_json::json!({"role":"assistant","content":format!("language {name}<asr_text>")}));
         body["continue_final_message"] = true.into();
@@ -420,16 +487,19 @@ fn request_body(wav: &[u8], language: &str, context: &str) -> serde_json::Value 
     body
 }
 
+fn forced_language(id: &str) -> Option<&'static str> {
+    options::language(id).and_then(|l| l.qwen_name)
+}
+
 fn parse_response(v: &serde_json::Value, language: &str) -> Result<String> {
     let choice = &v["choices"][0];
     if choice["finish_reason"] == "length" {
         bail!("transcript too long for one request");
     }
     let text = choice["message"]["content"].as_str().context("llama-server returned no text")?;
-    let forced = LANGUAGE_NAMES.iter().any(|(code, _)| *code == language);
     let text = match text.split_once("<asr_text>") {
         Some((_, rest)) => rest,
-        None if forced => text,
+        None if forced_language(language).is_some() => text,
         None => "", // auto mode always starts with "language X<asr_text>"; anything else is not a transcript
     };
     Ok(text.split_whitespace().collect::<Vec<_>>().join(" "))
@@ -453,8 +523,8 @@ fn wav_bytes(samples: &[f32]) -> Vec<u8> {
     out.extend_from_slice(&16u32.to_le_bytes());
     out.extend_from_slice(&1u16.to_le_bytes()); // PCM
     out.extend_from_slice(&1u16.to_le_bytes()); // mono
-    out.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
-    out.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes());
+    out.extend_from_slice(&audio::SAMPLE_RATE.to_le_bytes());
+    out.extend_from_slice(&(audio::SAMPLE_RATE * 2).to_le_bytes());
     out.extend_from_slice(&2u16.to_le_bytes());
     out.extend_from_slice(&16u16.to_le_bytes());
     out.extend_from_slice(b"data");
@@ -467,12 +537,12 @@ fn wav_bytes(samples: &[f32]) -> Vec<u8> {
 
 /// Splits audio into pieces of at most `max_seconds`, cutting at the quietest spot of the last 5 seconds.
 fn split_chunks(samples: &[f32], max_seconds: usize) -> Vec<&[f32]> {
-    let max = max_seconds * SAMPLE_RATE as usize;
-    let window = SAMPLE_RATE as usize / 20; // 50 ms
+    let max = max_seconds * audio::SAMPLE_RATE as usize;
+    let window = audio::SAMPLE_RATE as usize / 20; // 50 ms
     let mut out = Vec::new();
     let mut start = 0;
     while samples.len() - start > max {
-        let search_from = start + max - 5 * SAMPLE_RATE as usize;
+        let search_from = start + max - 5 * audio::SAMPLE_RATE as usize;
         let (mut best, mut best_energy) = (start + max, f32::MAX);
         let mut pos = search_from;
         while pos + window <= start + max {
@@ -497,10 +567,13 @@ mod tests {
     #[test]
     fn catalog_is_consistent() {
         for m in MODELS {
-            assert_eq!(find(m.id).unwrap().model_file, m.model_file);
+            assert_eq!(find(m.id).unwrap().model.name, m.model.name);
+            assert_eq!(m.model.sha256.len(), 64);
+            assert_eq!(m.mmproj.sha256.len(), 64);
             assert!(m.total_mb() > 100);
         }
         assert!(runtime_asset("cpu").is_ok() && runtime_asset("vulkan").is_ok() && runtime_asset("x").is_err());
+        assert!(!ready(Path::new("/nonexistent"), &QwenCfg::default()));
     }
 
     #[test]
