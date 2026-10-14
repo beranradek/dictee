@@ -25,8 +25,8 @@ Build needs: Rust, cmake, a C++ compiler, libclang, GTK 4 and libadwaita dev fil
 `wl-clipboard`. For auto-paste also `ydotool` (running `ydotoold`, access to `/dev/uinput`).
 
 1. Open **Dictee** from the app menu, download a model (Small is the default, Turbo compressed is best for Czech).
-2. Confirm the shortcut in the system dialog (default suggestion Ctrl+Alt+Space). If it does not work, use the **Install** button for the
-   GNOME keybinding fallback (Ctrl+Alt+D).
+2. Confirm the shortcut in the system dialog (default suggestion Ctrl+Shift+H). If it does not work, use the **Install** button for the
+   GNOME keybinding fallback (Ctrl+Shift+H).
 3. Dictate: press the shortcut, speak, press it again. The text is on the clipboard: Ctrl+V.
 
 Config: `~/.config/dictee/config.toml`. Models: `~/.local/share/dictee/models` (change the folder in settings).
@@ -41,6 +41,11 @@ dictee transcribe f.wav [--rewrite]
 dictee models [--download small]
 dictee mics
 ```
+
+## Not supported yet
+
+- Only Whisper (GGML) models. Parakeet (ONNX) and Qwen3-ASR (llama.cpp) are not supported, and Mluva's model files cannot be reused.
+- No remote STT (by design for phase 1).
 
 ## Wayland notes
 

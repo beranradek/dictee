@@ -173,15 +173,15 @@ pub fn build(app: &adw::Application, status: Status, _tx: Sender<Cmd>) -> adw::A
         });
     }
     let fallback_row = adw::ActionRow::builder()
-        .title("Fallback: GNOME keybinding Ctrl+Alt+D")
+        .title("Fallback: GNOME keybinding Ctrl+Shift+H")
         .subtitle("Use when the portal shortcut does not work. Toggle only (no hold to talk)")
         .build();
     let fb_btn = gtk::Button::builder().label("Install").valign(gtk::Align::Center).build();
     {
         let toasts = toasts.clone();
         fb_btn.connect_clicked(move |_| {
-            let msg = match shortcut::install_gnome_keybinding("<Control><Alt>d") {
-                Ok(()) => "Keybinding Ctrl+Alt+D installed".to_string(),
+            let msg = match shortcut::install_gnome_keybinding("<Control><Shift>h") {
+                Ok(()) => "Keybinding Ctrl+Shift+H installed".to_string(),
                 Err(e) => format!("Failed: {e:#}"),
             };
             toasts.add_toast(adw::Toast::new(&msg));

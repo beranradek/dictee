@@ -62,7 +62,7 @@ async fn run(tx: Sender<Cmd>, status: Status) -> Result<()> {
     Ok(())
 }
 
-/// Registers a GNOME custom keybinding that runs `dictee toggle`. `binding` looks like `<Control><Alt>d`.
+/// Registers a GNOME custom keybinding that runs `dictee toggle`. `binding` looks like `<Control><Shift>h`.
 pub fn install_gnome_keybinding(binding: &str) -> Result<()> {
     const SCHEMA: &str = "org.gnome.settings-daemon.plugins.media-keys";
     const PATH: &str = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/dictee/";

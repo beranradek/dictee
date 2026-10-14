@@ -34,7 +34,7 @@ pub struct Config {
     /// "auto", "cs" or "en"
     pub language: String,
     pub threads: i32,
-    /// Preferred trigger for the desktop portal, e.g. "CTRL+ALT+space"
+    /// Preferred trigger for the desktop portal, e.g. "CTRL+SHIFT+h"
     pub shortcut: String,
     /// Hold-to-talk: start on key press, stop on key release
     pub stop_on_release: bool,
@@ -59,7 +59,7 @@ impl Default for Config {
             model: "small".into(),
             language: "auto".into(),
             threads,
-            shortcut: "CTRL+ALT+space".into(),
+            shortcut: "CTRL+SHIFT+h".into(),
             stop_on_release: false,
             auto_paste: false,
             paste_keys: "ctrl+v".into(),
