@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Dictee
+GenericName=Speech to text dictation
+Comment=Local speech-to-text dictation
+Exec=@BIN@ settings
+Icon=audio-input-microphone
+Terminal=false
+Categories=Utility;Audio;
+Keywords=dictation;speech;voice;stt;
+StartupNotify=false
