@@ -122,7 +122,6 @@ impl Default for Config {
                 "Ubuntu",
                 "Wayland",
                 "PipeWire",
-                "Dictee",
             ]
             .iter()
             .map(|s| s.to_string())
