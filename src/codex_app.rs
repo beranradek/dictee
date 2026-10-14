@@ -46,8 +46,7 @@ struct Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        crate::util::kill_tree(&mut self.child);
     }
 }
 
@@ -109,6 +108,7 @@ fn spawn(cwd: &std::path::Path) -> Result<Session> {
     let mut cmd = Command::new("codex");
     cmd.arg("app-server");
     make_text_only(&mut cmd);
+    crate::util::isolate(&mut cmd); // own process group, killed as a whole when the session ends
     cmd.current_dir(cwd);
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = cmd.spawn().context("cannot run 'codex app-server' (is Codex installed and logged in?)")?;

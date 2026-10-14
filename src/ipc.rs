@@ -21,10 +21,23 @@ pub fn socket_path() -> PathBuf {
     if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
         return PathBuf::from(dir).join("dictee.sock");
     }
-    let dir = std::env::temp_dir().join(format!("dictee-{}", unsafe { libc::getuid() }));
-    let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-    dir.join("dictee.sock")
+    fallback_dir().join("dictee.sock")
+}
+
+/// Private per-user folder in the temp dir. When it already exists it must be ours and closed to others,
+/// otherwise another user could have planted it; then a fresh folder name is used.
+fn fallback_dir() -> PathBuf {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let uid = unsafe { libc::getuid() };
+    for attempt in 0..8 {
+        let name = if attempt == 0 { format!("dictee-{uid}") } else { format!("dictee-{uid}-{attempt}") };
+        let dir = std::env::temp_dir().join(name);
+        let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
+        if std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir() && m.uid() == uid && m.mode() & 0o077 == 0) {
+            return dir;
+        }
+    }
+    std::env::temp_dir().join(format!("dictee-{uid}-unsafe"))
 }
 
 /// Sends one command to the running daemon and returns its reply.
@@ -73,10 +86,10 @@ fn handle(conn: &UnixStream, tx: &Sender<Cmd>, state: &SharedState) -> Result<()
     let mut line = String::new();
     BufReader::new(conn.take(MAX_LINE)).read_line(&mut line)?;
     let reply = match parse(line.trim()) {
-        Some(Some(cmd)) => {
-            let _ = tx.send(cmd);
-            "ok".to_string()
-        }
+        Some(Some(cmd)) => match tx.send(cmd) {
+            Ok(()) => "ok".to_string(),
+            Err(_) => "error: the dictation controller is not running".to_string(),
+        },
         Some(None) => state.lock().unwrap().as_str().to_string(),
         None => format!("error: unknown command '{}'", line.trim()),
     };

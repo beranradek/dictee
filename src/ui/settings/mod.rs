@@ -1,159 +1,29 @@
 //! Settings window. Every change is saved (debounced) to the config file.
 
+mod downloads;
 mod form;
+mod saver;
 
 use crate::audio::Recorder;
 use crate::config::Config;
 use crate::shortcut::{self, Status};
-use crate::{models, qwen};
 use adw::prelude::*;
+use downloads::Downloads;
 use form::Form;
 use libadwaita as adw;
-use std::cell::Cell;
+use saver::Saver;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc;
 use std::time::Duration;
 
-const SAVE_DELAY: Duration = Duration::from_millis(300);
 const MIC_TEST_TICKS: u32 = 60; // 3 s at 50 ms
 
-fn toast(toasts: &adw::ToastOverlay, text: &str) {
+pub(super) fn toast(toasts: &adw::ToastOverlay, text: &str) {
     toasts.add_toast(adw::Toast::new(text));
 }
 
-fn button(label: &str) -> gtk::Button {
+pub(super) fn button(label: &str) -> gtk::Button {
     gtk::Button::builder().label(label).valign(gtk::Align::Center).build()
-}
-
-/// Saves the form to the config file shortly after the last change; edits made to the file by hand meanwhile are kept.
-struct Saver {
-    form: Rc<Form>,
-    toasts: adw::ToastOverlay,
-    generation: Cell<u32>,
-    dirty: Cell<bool>,
-}
-
-impl Saver {
-    fn schedule(self: &Rc<Self>) {
-        if self.form.busy.get() {
-            return;
-        }
-        self.dirty.set(true);
-        let generation = self.generation.get() + 1;
-        self.generation.set(generation);
-        let me = self.clone();
-        gtk::glib::timeout_add_local_once(SAVE_DELAY, move || {
-            if me.generation.get() == generation {
-                me.flush();
-            }
-        });
-    }
-
-    fn flush(&self) {
-        if !self.dirty.replace(false) {
-            return;
-        }
-        match Config::load() {
-            Ok(mut cfg) => {
-                self.form.apply(&mut cfg);
-                if let Err(e) = cfg.save() {
-                    toast(&self.toasts, &format!("Cannot save settings: {e:#}"));
-                }
-            }
-            Err(e) => toast(&self.toasts, &format!("Settings not saved - fix config.toml first: {e:#}")),
-        }
-    }
-}
-
-/// Download row for the model files of the selected speech engine.
-struct Downloads {
-    form: Rc<Form>,
-    toasts: adw::ToastOverlay,
-    row: adw::ActionRow,
-    button: gtk::Button,
-    progress: gtk::ProgressBar,
-    active: Cell<bool>,
-}
-
-impl Downloads {
-    fn new(form: &Rc<Form>, toasts: &adw::ToastOverlay) -> Rc<Self> {
-        let d = Rc::new(Self {
-            form: form.clone(),
-            toasts: toasts.clone(),
-            row: adw::ActionRow::builder().build(),
-            button: button("Download"),
-            progress: gtk::ProgressBar::builder().valign(gtk::Align::Center).width_request(140).visible(false).build(),
-            active: Cell::new(false),
-        });
-        d.row.add_suffix(&d.progress);
-        d.row.add_suffix(&d.button);
-        let me = d.clone();
-        d.button.connect_clicked(move |_| me.start());
-        d.update();
-        d
-    }
-
-    fn update(&self) {
-        let cfg = self.form.current();
-        let root = cfg.models_path();
-        let own_server = cfg.stt_engine == "qwen" && !cfg.qwen.server_path.trim().is_empty();
-        let missing_server = own_server && !std::path::Path::new(cfg.qwen.server_path.trim()).is_file();
-        let (ready, what) = if cfg.stt_engine == "qwen" {
-            (qwen::ready(&root, &cfg.qwen), "Qwen runtime and model")
-        } else {
-            (models::is_downloaded(&root, &cfg.model), "Selected model")
-        };
-        self.form.refresh(&root);
-        // A wrong own server path cannot be fixed by downloading: say so instead of offering a download that does nothing.
-        self.button.set_sensitive(!ready && !missing_server && !self.active.get());
-        self.row.set_title(what);
-        self.row.set_subtitle(&if missing_server {
-            format!("llama-server not found at {} - fix the path above", cfg.qwen.server_path.trim())
-        } else if ready {
-            "Ready".to_string()
-        } else {
-            "Not downloaded yet".to_string()
-        });
-    }
-
-    fn start(self: &Rc<Self>) {
-        let cfg = self.form.current();
-        self.active.set(true);
-        self.progress.set_visible(true);
-        self.progress.set_fraction(0.0);
-        self.update();
-        let (tx, rx) = mpsc::channel::<Result<(u64, u64), String>>();
-        std::thread::spawn(move || {
-            let report = |done, total| {
-                let _ = tx.send(Ok((done, total)));
-            };
-            let root = cfg.models_path();
-            let result = if cfg.stt_engine == "qwen" {
-                qwen::download_all(&root, &cfg.qwen, report)
-            } else {
-                models::download(&root, &cfg.model, report).map(|_| ())
-            };
-            let _ = tx.send(Err(result.err().map(|e| format!("{e:#}")).unwrap_or_default()));
-        });
-        let me = self.clone();
-        gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
-            let mut finished = None;
-            while let Ok(msg) = rx.try_recv() {
-                match msg {
-                    Ok((done, total)) if total > 0 => me.progress.set_fraction(done as f64 / total as f64),
-                    Ok(_) => me.progress.pulse(),
-                    Err(error) => finished = Some(error),
-                }
-            }
-            let Some(error) = finished else { return gtk::glib::ControlFlow::Continue };
-            me.active.set(false);
-            me.progress.set_visible(false);
-            me.update();
-            toast(&me.toasts, &if error.is_empty() { "Download finished".to_string() } else { format!("Download failed: {error}") });
-            gtk::glib::ControlFlow::Break
-        });
-    }
 }
 
 fn dictation_group(form: &Rc<Form>, status: Status, toasts: &adw::ToastOverlay) -> (adw::PreferencesGroup, Rc<dyn Fn()>) {
@@ -228,7 +98,7 @@ fn microphone_group(form: &Rc<Form>, toasts: &adw::ToastOverlay) -> adw::Prefere
     test_row.add_suffix(&test_btn);
     {
         let (form, toasts, level) = (form.clone(), toasts.clone(), level.clone());
-        test_btn.connect_clicked(move |btn| match Recorder::start(&form.selected_mic(), || {}) {
+        test_btn.connect_clicked(move |btn| match Recorder::start(&form.selected_mic(), |_| {}) {
             Ok(recorder) => run_mic_test(recorder, btn, &level),
             Err(e) => toast(&toasts, &format!("{e:#}")),
         });
@@ -324,7 +194,7 @@ pub fn build(app: &adw::Application, status: Status) -> adw::ApplicationWindow {
         Config::default()
     });
     let form = Form::new(&cfg);
-    let saver = Rc::new(Saver { form: form.clone(), toasts: toasts.clone(), generation: Cell::new(0), dirty: Cell::new(false) });
+    let saver = Saver::new(&form, &toasts);
     let downloads = Downloads::new(&form, &toasts);
 
     let (dictation, refresh_fallback) = dictation_group(&form, status, &toasts);
@@ -382,15 +252,28 @@ fn wire_autosave(form: &Rc<Form>, saver: &Rc<Saver>, downloads: &Rc<Downloads>, 
             }
         }))
     };
+    let refresh_view = {
+        let form = form.clone();
+        changed(Rc::new(move || {
+            if !form.busy.get() {
+                form.refresh_view();
+            }
+        }))
+    };
     let on_shortcut = changed(Rc::new(move || refresh_fallback()));
 
     for row in [&form.mic, &form.lang, &form.paste_keys] {
         let f = plain.clone();
         row.connect_selected_notify(move |_| f());
     }
-    for row in [&form.stt_engine, &form.whisper_model, &form.qwen_model, &form.qwen_device, &form.rw_engine] {
+    for row in [&form.stt_engine, &form.whisper_model, &form.qwen_model, &form.qwen_device] {
         let f = refresh_downloads.clone();
         row.connect_selected_notify(move |_| f());
+    }
+    {
+        // The rewrite engine only changes which rows are shown.
+        let f = refresh_view.clone();
+        form.rw_engine.connect_selected_notify(move |_| f());
     }
     for row in [&form.hold, &form.paste, &form.notify, &form.bubble] {
         let f = plain.clone();

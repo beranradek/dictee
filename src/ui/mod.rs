@@ -22,7 +22,7 @@ pub fn run(cmd_tx: Sender<Cmd>, events: async_channel::Receiver<Event>, status: 
         let Some(events) = events.borrow_mut().take() else { return };
         let ui = Rc::new(Ui {
             bubble: bubble::Bubble::new(app, cmd_tx.clone()),
-            settings: RefCell::new(None),
+            settings: Rc::default(),
             app: app.clone(),
             status: status.clone(),
             _hold: app.hold(), // the daemon keeps running without any window
@@ -42,7 +42,8 @@ pub fn run(cmd_tx: Sender<Cmd>, events: async_channel::Receiver<Event>, status: 
 
 struct Ui {
     bubble: Rc<bubble::Bubble>,
-    settings: RefCell<Option<adw::ApplicationWindow>>,
+    /// The open settings window. A closed window is destroyed (changes are saved on close), the next one is built from the file.
+    settings: Rc<RefCell<Option<adw::ApplicationWindow>>>,
     app: adw::Application,
     status: Status,
     _hold: gtk::gio::ApplicationHoldGuard,
@@ -60,7 +61,7 @@ impl Ui {
     }
 
     fn show_settings(&self) {
-        let mut slot = self.settings.borrow_mut();
+        let mut slot = RefCell::borrow_mut(&self.settings);
         if let Some(w) = slot.as_ref() {
             w.present();
             return;
@@ -69,10 +70,10 @@ impl Ui {
         if std::env::var_os("DICTEE_DEBUG").is_some() {
             w.connect_is_active_notify(|w| eprintln!("dictee: settings is-active = {}", w.is_active()));
         }
-        // Keep the window alive (hidden) so it can be shown again; settings::build flushes pending changes on close.
-        w.connect_close_request(|w| {
-            w.set_visible(false);
-            gtk::glib::Propagation::Stop
+        let registry = self.settings.clone();
+        w.connect_close_request(move |_| {
+            RefCell::borrow_mut(&registry).take(); // forget it; settings::build already flushes pending changes on close
+            gtk::glib::Propagation::Proceed
         });
         w.present();
         if let Ok(path) = std::env::var("DICTEE_SNAPSHOT_SETTINGS") {

@@ -2,7 +2,7 @@
 # End-to-end test with its own daemon and config (your settings and running daemon are not touched).
 # Plays synthesized speech (espeak-ng WAVs) through a virtual PipeWire microphone and checks the clipboard (which it overwrites).
 # Covers Whisper, Qwen3-ASR (llama.cpp) and the rewrite engines.
-# Needs: downloaded models (whisper "small", qwen3-1.7b-q4), pw-loopback, pw-play, wl-paste, python3.
+# Needs the models in your models folder (so it cannot run in CI): downloaded models (whisper "small", qwen3-1.7b-q4), pw-loopback, pw-play, wl-paste, python3.
 # Optional: claude and codex CLIs (E2E_SKIP_CLAUDE=1 / E2E_SKIP_CODEX=1 to skip). DICTEE_BIN overrides the binary,
 # DICTEE_MODELS_DIR the models folder. Do not copy anything while it runs.
 set -u
@@ -38,6 +38,7 @@ pw-loopback -m '[FL FR]' --capture-props='media.class=Audio/Sink node.name=dicte
 LOOP=$!
 python3 "$HERE/fake_openai.py" 4999 >/dev/null 2>&1 &
 FAKE=$!
+export OPENAI_API_KEY=x   # the daemon passes it to the API rewrite; the fake server answers 401 without it
 "$BIN" daemon >"$TMP/daemon.log" 2>&1 &
 DAEMON=$!
 trap '"$BIN" quit >/dev/null 2>&1; kill $LOOP $FAKE $DAEMON 2>/dev/null; rm -rf "$TMP"' EXIT
@@ -66,7 +67,7 @@ check qwen-cs cs_plain.wav 'administr'
 
 setkey stt_engine whisper; setkey language auto
 setrw engine openai; setrw model fake-model
-OPENAI_API_KEY=x check api-rewrite en_plain.wav '^PLEASE OPEN THE .*KUBERNETES DEPLOYMENT\.$'
+check api-rewrite en_plain.wav '^PLEASE OPEN THE .*KUBERNETES DEPLOYMENT\.$'
 if [ -z "${E2E_SKIP_CLAUDE:-}" ] && command -v claude >/dev/null; then
   setrw engine claude; setrw model ""
   check claude-rewrite cs_terms.wav 'radek beran.*kubernetes.*etneter'

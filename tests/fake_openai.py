@@ -6,6 +6,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 class H(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if self.headers.get("Authorization") != "Bearer x":  # the tests configure the key "x"
+            self.send_response(401); self.end_headers(); return
         user = body["messages"][-1]["content"]
         text = user.split("<<<\n", 1)[1].rsplit("\n>>>", 1)[0] if "<<<" in user else user
         print(f"path={self.path} auth={self.headers.get('Authorization')} model={body['model']} sys={body['messages'][0]['role']}", flush=True)

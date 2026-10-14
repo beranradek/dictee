@@ -9,7 +9,6 @@ use crate::{audio, options, util};
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Sender};
@@ -194,7 +193,7 @@ pub fn download_all(root: &Path, cfg: &QwenCfg, mut progress: impl FnMut(u64, u6
     if need_runtime {
         let runtime = runtime_dir(root, &cfg.device);
         let archive = runtime.with_extension("tar.gz");
-        download::fetch(asset.url, &archive, asset.sha256, |d, _| progress(d, total))?;
+        download::fetch(asset.url, &archive, asset.sha256, asset.size, |d, _| progress(d, total))?;
         base += asset.size;
         let unpacked = unpack(&archive, &runtime);
         let _ = std::fs::remove_file(&archive);
@@ -316,23 +315,29 @@ impl Server {
     }
 
     /// Starts (or reuses) the server and returns a lease. Blocks until the server answers `/health`.
-    fn acquire(&self, cfg: &Config, warm: bool) -> Result<Lease> {
+    /// A warm-up that was cancelled while it waited for its turn returns `None` and starts nothing.
+    fn acquire(&self, cfg: &Config, warm: bool) -> Result<Option<Lease>> {
         let sig = signature(cfg);
         let _one_start_at_a_time = self.start_lock.lock().unwrap();
         {
             let mut g = self.inner.lock().unwrap();
+            if warm && g.warm_since.is_none() {
+                return Ok(None);
+            }
             g.keep_alive = Duration::from_secs(cfg.qwen.keep_alive_secs);
             g.last_used = Some(Instant::now());
-            g.warm_since = warm.then(Instant::now);
+            if !warm {
+                g.warm_since = None; // a real request ends the warm-up phase
+            }
             if g.running.as_mut().is_some_and(|r| r.signature == sig && matches!(r.child.try_wait(), Ok(None))) {
-                return Ok(self.lease(&mut g, warm, cfg));
+                return Ok(Some(self.lease(&mut g, warm, cfg)));
             }
             g.running = None; // stops a server that is dead or configured differently
         }
         let running = start(cfg, sig, &self.spawner)?; // slow: `inner` is not held, so cancel and stop stay responsive
         let mut g = self.inner.lock().unwrap();
         g.running = Some(running);
-        Ok(self.lease(&mut g, warm, cfg))
+        Ok(Some(self.lease(&mut g, warm, cfg)))
     }
 
     fn lease(&self, g: &mut Inner, warm: bool, cfg: &Config) -> Lease {
@@ -341,8 +346,10 @@ impl Server {
         Lease { inner: self.inner.clone(), port: r.port, key: r.key.clone(), stop_when_unused: !warm && cfg.qwen.keep_alive_secs == 0 }
     }
 
-    /// Fire and forget start, used at the beginning of a recording.
+    /// Fire and forget start, used at the beginning of a recording. The warm flag is set here, on the caller's thread, so a
+    /// later `cancel_warmup` always wins over a warm-up that has not started yet.
     pub fn prewarm(&self, cfg: Config) {
+        self.inner.lock().unwrap().warm_since = Some(Instant::now());
         let me = self.clone();
         std::thread::spawn(move || {
             if let Err(e) = me.acquire(&cfg, true) {
@@ -351,13 +358,13 @@ impl Server {
         });
     }
 
-    /// The recording was cancelled: the warm server may now follow the normal keep-alive rule.
+    /// The recording ended or was cancelled: the warm server may now follow the normal keep-alive rule.
     pub fn cancel_warmup(&self) {
         self.inner.lock().unwrap().warm_since = None;
     }
 
     pub fn transcribe(&self, cfg: &Config, samples: &[f32]) -> Result<String> {
-        let lease = self.acquire(cfg, false)?;
+        let lease = self.acquire(cfg, false)?.expect("a real request always gets a lease");
         let context = crate::stt::build_prompt(&cfg.clean_phrases());
         let mut parts = Vec::new();
         for chunk in split_chunks(samples, MAX_CHUNK_SECONDS) {
@@ -419,13 +426,7 @@ fn start(cfg: &Config, signature: String, spawner: &Sender<SpawnRequest>) -> Res
     util::restrict_env(&mut cmd, SERVER_ENV);
     let debug = std::env::var_os("DICTEE_DEBUG").is_some();
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(if debug { Stdio::inherit() } else { Stdio::null() });
-    // Die with the daemon, even when it crashes.
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-            Ok(())
-        });
-    }
+    util::die_with_parent(&mut cmd); // dies with the daemon, even when it crashes
     let (reply_tx, reply_rx) = mpsc::channel();
     spawner.send((cmd, reply_tx)).map_err(|_| anyhow::anyhow!("spawner thread is gone"))?;
     let child = reply_rx.recv()?.with_context(|| format!("cannot start {}", binary.display()))?;

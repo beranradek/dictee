@@ -155,7 +155,12 @@ fn list_models(download: Option<String>) -> Result<()> {
 
 fn daemon(show_settings: bool) -> Result<()> {
     use std::sync::{Arc, Mutex, mpsc};
-    Config::load()?; // fail early (and write defaults) on first start
+    // Writes the defaults on first start. An invalid file must not stop the daemon: the settings window can still open and
+    // dictation reports the problem when it is started.
+    if let Err(e) = Config::load() {
+        eprintln!("dictee: {e:#}");
+        deliver::notify("Dictee: invalid configuration", &util::truncate(&format!("{e:#}"), 300));
+    }
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let (event_tx, event_rx) = async_channel::unbounded();
     let state = Arc::new(Mutex::new(controller::State::Idle));

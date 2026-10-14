@@ -36,18 +36,20 @@ Build needs: Rust, cmake, a C++ compiler, libclang, GTK 4 and libadwaita dev fil
 1. Open **Dictee** from the app menu, choose the speech engine and download a model (Whisper Small is the default; Qwen3-ASR 1.7B Q4
    is Mluva's recommended model and about 1.6 GB).
 2. Confirm the shortcut in the system dialog (default suggestion Ctrl+Shift+H). If it does not work, use the **Install** button for the
-   GNOME keybinding fallback (Ctrl+Shift+H).
+   GNOME or KDE keybinding fallback (it uses the shortcut from the settings field).
 3. Dictate: press the shortcut, speak, press it again. The text is on the clipboard: Ctrl+V.
 
 Config: `~/.config/dictee/config.toml`. Models: `~/.local/share/dictee/models` (change the folder in settings).
 
 ## How it behaves
 
-- While a dictation is being transcribed (bubble visible), shortcut presses and `dictee toggle|start|stop|cancel` are ignored. Wait until
-  the bubble is gone. This avoids ghost recordings.
+- While a dictation is being transcribed (bubble visible), a new start (shortcut, `dictee toggle|start`) is ignored. `dictee cancel`
+  (or right click on the bubble) cancels the running transcription: nothing is copied. `dictee quit` works at any time.
 - Recordings shorter than 0.4 s, and recordings with no signal at all (dead or muted microphone), are not sent to the models.
 - A recording stops by itself after 15 minutes.
 - Model downloads are pinned to a fixed commit and SHA-256, have timeouts, and resume after a failure.
+- A rewrite reply is checked before it is used: control characters are removed, and a reply that is much longer than what was said
+  (for example an LLM that followed instructions hidden in the audio) is rejected and the raw text is used instead.
 - Errors (missing model, microphone not connected, invalid `config.toml`) show as a desktop notification and in the daemon log.
 - Privacy: with a rewrite engine on, the transcript and your phrase list go to that engine (the CLI's service or your API server).
   The default phrases are generic tech terms; add your own names in Settings.
@@ -93,7 +95,8 @@ dictee mics
 | `ui` | libadwaita application, bubble, settings window (form, debounced autosave, downloads) |
 
 Developer environment variables: `DICTEE_CONFIG` (config file), `DICTEE_SOCKET` (daemon socket), `DICTEE_NO_PORTAL=1` (no portal shortcut),
-`DICTEE_DEBUG=1` (more logs), `DICTEE_SNAPSHOT_SETTINGS=file.png` / `DICTEE_SNAPSHOT_BUBBLE=dir` (render windows to PNG).
+`DICTEE_DEBUG=1` (more logs), `DICTEE_SNAPSHOT_SETTINGS=file.png` (makes the window taller; `DICTEE_SNAPSHOT_PART=lower` hides the top groups) /
+`DICTEE_SNAPSHOT_BUBBLE=dir` (render windows to PNG).
 
 ## Tests
 

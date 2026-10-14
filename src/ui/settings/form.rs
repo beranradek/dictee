@@ -56,6 +56,8 @@ pub struct Form {
     pub phrases: gtk::TextBuffer,
     /// Set while widgets are filled programmatically, so no half-updated state gets saved
     pub busy: Cell<bool>,
+    /// The configuration the widgets were last filled from or saved as; only differences to it are written to the file
+    baseline: RefCell<Config>,
 }
 
 impl Form {
@@ -92,6 +94,7 @@ impl Form {
             rw_extra: entry("Extra instructions (optional)"),
             phrases: gtk::TextBuffer::new(None),
             busy: Cell::new(false),
+            baseline: RefCell::new(cfg.clone()),
         });
         f.threads.set_title("CPU threads");
         f.qwen_keep.set_title("Keep model loaded (seconds, 0 = unload at once)");
@@ -101,6 +104,7 @@ impl Form {
 
     /// Shows `cfg` in the widgets.
     pub fn fill(&self, cfg: &Config) {
+        *self.baseline.borrow_mut() = cfg.clone();
         self.busy.set(true);
         self.shortcut.set_text(&cfg.shortcut);
         self.hold.set_active(cfg.stop_on_release);
@@ -158,11 +162,26 @@ impl Form {
         c.phrases = self.phrases.text(&s, &e, false).lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
     }
 
-    /// The configuration as the widgets show it now (on top of the saved file, or the defaults when it cannot be read).
-    pub fn current(&self) -> Config {
-        let mut c = Config::load().unwrap_or_default();
+    /// The configuration as the widgets show it now. No file access: it is the baseline with the widget values on top.
+    pub fn snapshot(&self) -> Config {
+        let mut c = self.baseline.borrow().clone();
         self.apply(&mut c);
         c
+    }
+
+    /// `(baseline, widgets)`: what to save is the difference between the two.
+    pub fn pending(&self) -> (Config, Config) {
+        (self.baseline.borrow().clone(), self.snapshot())
+    }
+
+    /// Remembers what was saved, so the next save only writes later changes.
+    pub fn mark_saved(&self, saved: Config) {
+        *self.baseline.borrow_mut() = saved;
+    }
+
+    /// Updates which rows are shown and the size / download hints, for the models folder the widgets name.
+    pub fn refresh_view(&self) {
+        self.refresh(&self.snapshot().models_path());
     }
 
     /// Shows only the rows of the selected engines and updates the size / download hints.

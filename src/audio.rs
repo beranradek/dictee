@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -42,17 +42,27 @@ fn parse_pw_dump(json: &str) -> Result<Vec<Mic>> {
     Ok(mics)
 }
 
+/// Why a recording ended without the user asking for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndReason {
+    /// `MAX_SECONDS` reached; later audio is not kept
+    Limit,
+    /// The `pw-record` stream ended (PipeWire restarted, microphone unplugged)
+    Died,
+}
+
 pub struct Recorder {
     child: Child,
     reader: JoinHandle<()>,
+    stopping: Arc<AtomicBool>,
     samples: Arc<Mutex<Vec<i16>>>,
     level: Arc<AtomicU32>,
 }
 
 impl Recorder {
     /// Starts capturing 16 kHz mono from `mic` (empty = default source). Fails when `pw-record` dies right away.
-    /// `on_limit` runs once when the recording reaches `MAX_SECONDS` (audio after that point is not kept).
-    pub fn start(mic: &str, on_limit: impl FnOnce() + Send + 'static) -> Result<Self> {
+    /// `on_end` runs (once, on the reader thread) when the recording ends by itself, see `EndReason`.
+    pub fn start(mic: &str, on_end: impl FnOnce(EndReason) + Send + 'static) -> Result<Self> {
         // pw-record waits forever for a target that does not exist, so check that the microphone is connected.
         if !mic.is_empty() && list_mics().is_ok_and(|mics| !mics.iter().any(|m| m.node_name == mic)) {
             bail!("microphone '{mic}' is not connected - choose another one in Settings");
@@ -68,9 +78,10 @@ impl Recorder {
         let mut stderr = child.stderr.take().context("no pw-record stderr")?;
         let samples = Arc::new(Mutex::new(Vec::new()));
         let level = Arc::new(AtomicU32::new(0));
-        let (s2, l2) = (samples.clone(), level.clone());
+        let stopping = Arc::new(AtomicBool::new(false));
+        let (s2, l2, stop2) = (samples.clone(), level.clone(), stopping.clone());
         let reader = std::thread::spawn(move || {
-            let mut on_limit = Some(on_limit);
+            let mut on_end = Some(on_end);
             let mut buf = [0u8; 4096];
             let mut odd: Option<u8> = None;
             while let Ok(n) = stdout.read(&mut buf) {
@@ -93,10 +104,15 @@ impl Recorder {
                 let mut all = s2.lock().unwrap();
                 if all.len() < MAX_SECONDS * SAMPLE_RATE as usize {
                     all.extend_from_slice(&chunk);
-                } else if let Some(f) = on_limit.take() {
+                } else if let Some(f) = on_end.take() {
                     drop(all);
-                    f();
+                    f(EndReason::Limit);
                 }
+            }
+            if !stop2.load(Ordering::SeqCst)
+                && let Some(f) = on_end.take()
+            {
+                f(EndReason::Died); // EOF that nobody asked for
             }
         });
         // A bad target or a stopped PipeWire makes pw-record exit at once: report that now, not after the user has spoken.
@@ -114,7 +130,7 @@ impl Recorder {
             let mut sink = Vec::new();
             let _ = stderr.read_to_end(&mut sink); // drain so pw-record can never block on a full pipe
         });
-        Ok(Self { child, reader, samples, level })
+        Ok(Self { child, reader, stopping, samples, level })
     }
 
     /// Current input level (RMS of the last chunk, 0..32767).
@@ -124,6 +140,7 @@ impl Recorder {
 
     /// Stops capture and returns the audio as f32 in -1..1 (empty when nothing was captured).
     pub fn stop(mut self) -> Vec<f32> {
+        self.stopping.store(true, Ordering::SeqCst);
         // SIGTERM lets pw-record finish cleanly (SIGINT is ignored by processes started as background jobs);
         // after a grace period it is killed. The audio was read from its pipe all along, so nothing is lost.
         unsafe {
@@ -141,6 +158,7 @@ impl Recorder {
     }
 
     pub fn cancel(mut self) {
+        self.stopping.store(true, Ordering::SeqCst);
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = self.reader.join();

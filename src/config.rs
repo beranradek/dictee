@@ -180,8 +180,11 @@ impl Config {
 
     /// Loads the config; a missing file gives (and writes) the defaults, a broken file is an error.
     pub fn load() -> Result<Self> {
-        let path = Self::path();
-        match std::fs::read_to_string(&path) {
+        Self::load_from(&Self::path())
+    }
+
+    pub fn load_from(path: &std::path::Path) -> Result<Self> {
+        match std::fs::read_to_string(path) {
             Ok(text) => {
                 let mut cfg: Self = toml::from_str(&text).with_context(|| format!("invalid config {}", path.display()))?;
                 cfg.threads = cfg.threads.clamp(1, 64);
@@ -191,7 +194,7 @@ impl Config {
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let cfg = Self::default();
-                cfg.save()?;
+                cfg.save_to(path)?;
                 Ok(cfg)
             }
             Err(e) => Err(e).with_context(|| format!("cannot read {}", path.display())),
@@ -199,12 +202,37 @@ impl Config {
     }
 
     pub fn save(&self) -> Result<()> {
-        let path = Self::path();
+        self.save_to(&Self::path())
+    }
+
+    pub fn save_to(&self, path: &std::path::Path) -> Result<()> {
         std::fs::create_dir_all(path.parent().unwrap_or(std::path::Path::new(".")))?;
         let tmp = path.with_extension("toml.tmp");
         std::fs::write(&tmp, toml::to_string_pretty(self)?)?;
         std::fs::rename(&tmp, path)?;
         Ok(())
+    }
+
+    /// Applies only what differs between `before` and `after` onto `target`.
+    /// The settings window uses it so that a value it never touched (e.g. edited in the file meanwhile) is not overwritten.
+    pub fn merge_changes(before: &Self, after: &Self, target: &Self) -> Result<Self> {
+        use serde_json::{Value, to_value};
+        fn merge(before: &Value, after: &Value, target: &mut Value) {
+            if let (Value::Object(b), Value::Object(a), Value::Object(t)) = (before, after, &mut *target) {
+                for (key, new) in a {
+                    match (b.get(key), t.get_mut(key)) {
+                        (Some(old), _) if old == new => {}
+                        (Some(old), Some(slot)) if old.is_object() && new.is_object() => merge(old, new, slot),
+                        _ => {
+                            t.insert(key.clone(), new.clone());
+                        }
+                    }
+                }
+            }
+        }
+        let mut merged = to_value(target)?;
+        merge(&to_value(before)?, &to_value(after)?, &mut merged);
+        Ok(serde_json::from_value(merged)?)
     }
 
     /// Phrases without blanks or duplicates.
@@ -252,6 +280,50 @@ mod tests {
         assert_eq!(cfg.models_path(), PathBuf::from("/mnt/data/models"));
         cfg.models_dir = "~/m".into();
         assert!(!cfg.models_path().starts_with("~") && cfg.models_path().ends_with("m"));
+    }
+
+    #[test]
+    fn load_creates_defaults_and_rejects_broken_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub").join("config.toml");
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg, Config::default());
+        assert!(path.is_file(), "defaults are written on first load");
+        std::fs::write(&path, "threads = 1000\n[qwen]\nthreads = -5\n").unwrap();
+        let clamped = Config::load_from(&path).unwrap();
+        assert_eq!((clamped.threads, clamped.qwen.threads), (64, 0));
+        std::fs::write(&path, "language = \"xx\"\n").unwrap();
+        assert!(Config::load_from(&path).unwrap_err().to_string().contains("invalid config"));
+        std::fs::write(&path, "not toml [[[").unwrap();
+        assert!(Config::load_from(&path).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not toml [[[", "a broken file is never overwritten by load");
+    }
+
+    #[test]
+    fn save_then_load_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.toml");
+        let mut cfg = Config::default();
+        cfg.rewrite.engine = "openai".into();
+        cfg.phrases = vec!["Zeta".into()];
+        cfg.save_to(&path).unwrap();
+        assert_eq!(Config::load_from(&path).unwrap(), cfg);
+    }
+
+    #[test]
+    fn merge_applies_only_changed_fields() {
+        let before = Config::default();
+        let mut after = before.clone(); // what the settings window shows after the user changed two things
+        after.notify = !before.notify;
+        after.rewrite.engine = "claude".into();
+        let mut target = before.clone(); // the file, edited by hand meanwhile
+        target.model = "medium".into();
+        target.rewrite.timeout_secs = 99;
+        let merged = Config::merge_changes(&before, &after, &target).unwrap();
+        assert_eq!(merged.model, "medium", "untouched field keeps the hand edit");
+        assert_eq!(merged.rewrite.timeout_secs, 99, "nested untouched field keeps the hand edit");
+        assert_eq!(merged.notify, after.notify);
+        assert_eq!(merged.rewrite.engine, "claude");
     }
 
     #[test]

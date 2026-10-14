@@ -7,8 +7,12 @@ use std::process::{Command, Stdio};
 /// Puts text on the clipboard. Uses wl-copy on Wayland, xclip/xsel on X11.
 pub fn copy(text: &str) -> Result<()> {
     let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
-    let candidates: &[(&str, &[&str])] =
-        if wayland { &[("wl-copy", &[])] } else { &[("xclip", &["-selection", "clipboard"]), ("xsel", &["--clipboard", "--input"])] };
+    // An explicit text type: without it wl-copy guesses from the content and may offer e.g. "#!/bin/sh" as a non-text type.
+    let candidates: &[(&str, &[&str])] = if wayland {
+        &[("wl-copy", &["--type", "text/plain;charset=utf-8"])]
+    } else {
+        &[("xclip", &["-selection", "clipboard", "-t", "UTF8_STRING"]), ("xsel", &["--clipboard", "--input"])]
+    };
     for (bin, args) in candidates {
         match Command::new(bin).args(*args).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
             Ok(mut child) => {
@@ -39,6 +43,12 @@ pub fn paste(keys: &str) -> Result<()> {
     Ok(())
 }
 
+/// Shows a desktop notification without waiting for it: a stuck notification daemon must never block dictation.
 pub fn notify(title: &str, body: &str) {
-    let _ = Command::new("notify-send").args(["-a", "Dictee", "-t", "3000", "--", title, body]).status(); // "--": text may start with "-"
+    // "--": the text may start with "-"
+    if let Ok(mut child) = Command::new("notify-send").args(["-a", "Dictee", "-t", "3000", "--", title, body]).spawn() {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
 }
