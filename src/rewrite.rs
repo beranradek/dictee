@@ -3,7 +3,7 @@
 use crate::config::{Config, RewriteCfg};
 use anyhow::{Context, Result, bail};
 use std::io::{Read, Write};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -150,7 +150,8 @@ fn run_cli(rw: &RewriteCfg, prompt: &str, cancel: &AtomicBool) -> Result<String>
     let out_file = dir.path().join("out.txt");
     let mut cmd = match rw.engine.as_str() {
         "claude" => {
-            let mut cmd = Command::new("claude");
+            let mut cmd = crate::util::cli_command("claude");
+            crate::util::prepend_program_dir(&mut cmd);
             // No built-in tools, no MCP servers, no slash commands or skills: the transcript is untrusted input.
             cmd.args([
                 "-p",
@@ -168,7 +169,7 @@ fn run_cli(rw: &RewriteCfg, prompt: &str, cancel: &AtomicBool) -> Result<String>
             cmd
         }
         _ => {
-            let mut cmd = Command::new("codex");
+            let mut cmd = crate::util::cli_command("codex");
             cmd.args(["exec", "--skip-git-repo-check", "--ephemeral", "-s", "read-only", "-o"]).arg(&out_file);
             crate::codex_app::make_text_only(&mut cmd); // no shell or file tools: the transcript is untrusted input
             if !rw.model.trim().is_empty() {

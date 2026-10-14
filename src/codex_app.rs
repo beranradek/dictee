@@ -112,10 +112,11 @@ pub fn make_text_only(cmd: &mut Command) {
         cmd.arg("-c").arg(format!("features.{feature}=false"));
     }
     crate::util::restrict_env(cmd, ENV_ALLOWED);
+    crate::util::prepend_program_dir(cmd);
 }
 
 fn spawn(cwd: &std::path::Path) -> Result<Session> {
-    let mut cmd = Command::new("codex");
+    let mut cmd = crate::util::cli_command("codex");
     cmd.arg("app-server");
     make_text_only(&mut cmd);
     crate::util::isolate(&mut cmd); // own process group, killed as a whole when the session ends

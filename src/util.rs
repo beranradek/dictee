@@ -51,6 +51,37 @@ pub fn which(bin: &str) -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join(bin)).find(|p| p.is_file())
 }
 
+/// User-level install dirs (npm, pnpm, bun, cargo, pipx). A desktop session often lacks them in PATH: shell profiles are not read there.
+fn user_bin_dirs() -> Vec<PathBuf> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return Vec::new() };
+    [".npm-global/bin", ".local/bin", ".local/share/pnpm", ".bun/bin", ".cargo/bin", "bin"].iter().map(|d| home.join(d)).collect()
+}
+
+fn find_in(bin: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+    dirs.iter().map(|d| d.join(bin)).find(|p| p.is_file())
+}
+
+/// Command for a user-installed CLI: looks in PATH first, then in the user-level install dirs. Falls back to the bare name.
+pub fn cli_command(bin: &str) -> Command {
+    let found = which(bin).or_else(|| find_in(bin, &user_bin_dirs()));
+    Command::new(found.as_deref().map_or(bin.as_ref(), |p| p.as_os_str()))
+}
+
+/// Puts the directory of the program first in the child's PATH, so launcher scripts (`#!/usr/bin/env node`) find their siblings.
+/// Call after `restrict_env`, which clears the environment.
+pub fn prepend_program_dir(cmd: &mut Command) {
+    let Some(dir) = std::path::Path::new(cmd.get_program()).parent().filter(|d| !d.as_os_str().is_empty()).map(|d| d.to_path_buf()) else {
+        return;
+    };
+    let current =
+        cmd.get_envs().find(|(k, _)| *k == "PATH").and_then(|(_, v)| v.map(|v| v.to_owned())).or_else(|| std::env::var_os("PATH"));
+    let mut dirs = vec![dir];
+    dirs.extend(current.iter().flat_map(std::env::split_paths));
+    if let Ok(joined) = std::env::join_paths(dirs) {
+        cmd.env("PATH", joined);
+    }
+}
+
 /// HTTP client with a global timeout. `env_proxy = false` ignores proxy variables (use for loopback servers).
 pub fn http_agent(timeout: Duration, env_proxy: bool) -> ureq::Agent {
     let builder = ureq::Agent::config_builder().timeout_global(Some(timeout)).http_status_as_error(true);
@@ -172,6 +203,20 @@ mod tests {
         restrict_env(&mut cmd, &["PATH"]);
         let out = String::from_utf8(cmd.output().unwrap().stdout).unwrap();
         assert!(out.lines().all(|l| l.starts_with("PATH=")), "only PATH survives: {out}");
+    }
+
+    #[test]
+    fn find_in_uses_extra_dirs_and_prepend_adds_program_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("fake-cli");
+        std::fs::write(&bin, "#!/bin/sh\necho $PATH\n").unwrap();
+        assert_eq!(find_in("fake-cli", &[dir.path().to_path_buf()]), Some(bin.clone()));
+        assert!(find_in("fake-cli", &[]).is_none());
+        let mut cmd = Command::new(&bin);
+        restrict_env(&mut cmd, &["PATH"]);
+        prepend_program_dir(&mut cmd);
+        let path = cmd.get_envs().find(|(k, _)| *k == "PATH").unwrap().1.unwrap().to_owned();
+        assert_eq!(std::env::split_paths(&path).next().unwrap(), dir.path());
     }
 
     #[test]
